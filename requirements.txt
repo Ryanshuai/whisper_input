@@ -1,6 +1,5 @@
 numpy
 sounddevice
-webrtcvad-wheels
 faster-whisper
 keyboard
 pyperclip

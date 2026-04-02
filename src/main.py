@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings('ignore', message='pkg_resources is deprecated')
+
 import os
 import signal
 import threading
@@ -8,19 +11,19 @@ import keyboard
 import numpy as np
 import pyperclip
 import sounddevice as sd
-import webrtcvad
 import yaml
 from faster_whisper import WhisperModel
 
-cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), 'config.yaml')))
+cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), 'config.yaml'), encoding='utf-8'))
 
-print('Loading model...')
-model = WhisperModel(
-    cfg.get('model_path') or cfg.get('model', 'base'),
-    device='cpu' if cfg.get('compute_type') == 'int8' else cfg.get('device', 'auto'),
-    compute_type=cfg.get('compute_type', 'default'),
-)
-print('Model loaded.')
+model_name = cfg.get('model_path') or cfg.get('model', 'base')
+device = 'cpu' if cfg.get('compute_type') == 'int8' else cfg.get('device', 'auto')
+compute = cfg.get('compute_type', 'default')
+print(f'Loading model: {model_name} ({device}, {compute})...')
+model = WhisperModel(model_name, device=device, compute_type=compute)
+print('Warming up...')
+model.transcribe(np.zeros(16000, dtype=np.float32))
+print('Ready.')
 
 recording = False
 worker = None
@@ -28,15 +31,11 @@ worker = None
 def run_pipeline():
     global recording
     recording = True
+    print(f'\n{"─"*40}')
     print('Recording...')
 
     sr = cfg.get('sample_rate', 16000)
     frame_size = int(sr * 0.03)
-    silence_limit = int(cfg.get('silence_duration', 900) / 30)
-    skip = int(0.15 * sr / frame_size)
-    vad = webrtcvad.Vad(2)
-    speech_detected = False
-    silent = 0
     buf = deque(maxlen=frame_size)
     frames = []
     ready = threading.Event()
@@ -53,23 +52,10 @@ def run_pipeline():
             frame = np.array(list(buf), dtype=np.int16)
             buf.clear()
             frames.extend(frame)
-            if skip > 0:
-                skip -= 1; continue
-            if vad.is_speech(frame.tobytes(), sr):
-                silent = 0
-                if not speech_detected:
-                    print('Speech detected.')
-                    speech_detected = True
-            else:
-                silent += 1
-            if speech_detected and silent > silence_limit:
-                break
 
     audio = np.array(frames, dtype=np.int16)
     dur = len(audio) / sr
     print(f'Recorded {dur:.1f}s')
-    if dur * 1000 < cfg.get('min_duration', 100):
-        return
 
     print('Transcribing...')
     t0 = time.time()
