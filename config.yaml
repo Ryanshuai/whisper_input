@@ -2,16 +2,12 @@
 model: large-v3
 device: cuda
 compute_type: float16
-language: null
+language: zh
 temperature: 0.0
 initial_prompt: "以下是普通话和英语的句子。"
 condition_on_previous_text: true
 vad_filter: true
-model_path: null
 
 # Recording
 activation_key: f13
 sample_rate: 16000
-
-# Misc
-print_to_terminal: true

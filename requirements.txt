@@ -1,6 +1,0 @@
-numpy
-sounddevice
-faster-whisper
-keyboard
-pyperclip
-pyyaml

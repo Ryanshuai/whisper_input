@@ -1,0 +1,29 @@
+[workspace]
+name = "whisper-writer"
+version = "0.1.0"
+description = "Minimal whisper voice input tool"
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-64"]
+
+[dependencies]
+python = ">=3.11,<3.12"
+numpy = "*"
+pyyaml = "*"
+cffi = "*"
+onnxruntime = "*"
+pynput = "*"
+pyperclip = "*"
+setuptools = ">=70,<81"
+
+[target.win-64.dependencies]
+vc = "*"
+vs2015_runtime = "*"
+
+# conda-forge 上没有的包才放这里
+[pypi-dependencies]
+sounddevice = "*"
+ctranslate2 = ">=4.5,<4.8"
+faster-whisper = "*"
+
+[tasks]
+start = { cmd = "python main.py", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
