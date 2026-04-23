@@ -14,6 +14,7 @@ onnxruntime = "*"
 pynput = "*"
 pyperclip = "*"
 setuptools = ">=70,<81"
+ffmpeg = "*"
 
 [target.win-64.dependencies]
 vc = "*"
@@ -24,6 +25,11 @@ vs2015_runtime = "*"
 sounddevice = "*"
 ctranslate2 = ">=4.5,<4.8"
 faster-whisper = "*"
+silero-vad = "*"
+edge-tts = "*"
+claude-agent-sdk = "*"
+tokenizers = "*"          # 轻量 Rust tokenizer，避免拉 torch
+huggingface-hub = "*"     # model download
 
 [tasks]
 start = { cmd = "python main.py", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }

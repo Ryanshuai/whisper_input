@@ -1,3 +1,5 @@
 .pixi/
 __pycache__/
 *.pyc
+.env
+conversations.jsonl

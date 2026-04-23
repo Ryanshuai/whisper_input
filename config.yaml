@@ -5,9 +5,114 @@ compute_type: float16
 language: zh
 temperature: 0.0
 initial_prompt: "以下是普通话和英语的句子。"
-condition_on_previous_text: true
-vad_filter: true
+hotwords: "Claude"  # faster-whisper 词偏置：引导识别成 Claude 而不是 Cloud（不会被吐进转录结果）
+condition_on_previous_text: false
+vad_filter: false  # 我们用外部 silero-vad 流式切片
 
-# Recording
-activation_key: f13
+# Hotkeys
+activation_key:                   # 留空：禁用对话模式快捷键，只靠语音唤醒词「Claude 开始/关闭」
+dictation_key: f13                # F13 = 语音输入模式（转录后粘贴到当前应用）
+dictation_press_enter: true       # 语音输入完成后是否自动按回车提交
 sample_rate: 16000
+
+# Conversation
+# 走订阅 quota 时模型选最聪明的就行：opus > sonnet > haiku。
+# 模型 ID: claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
+# 留空 = 用 Claude Code CLI 的默认模型。
+chat_model: claude-opus-4-7
+auto_off_minutes: 5
+log_file: conversations.jsonl     # 本地对话日志（每行一个 user→assistant 记录）
+
+# TTS 默认参数
+tts_voice: zh-CN-XiaoyiNeural     # 起始音色：少女音
+tts_rate_pct: 80                  # 语速百分比偏移（-50 到 +100）；+80% ≈ 1.8 倍速
+tts_volume_pct: 0                 # 音量百分比偏移（-50 到 +100）
+
+# TTS 音色快捷标签（语音控制时用，可任意扩展）
+tts_voices:
+  female: zh-CN-XiaoxiaoNeural    # 女声温柔
+  male: zh-CN-YunxiNeural         # 男声青年
+  news: zh-CN-YunyangNeural       # 男声新闻播报
+  young_female: zh-CN-XiaoyiNeural   # 女声少女
+  young_male: zh-CN-YunxiaNeural     # 男声少年
+
+# VAD（粗端点检测，配合下面的 EOU 模型做精判断）
+vad_threshold: 0.5                # silero-vad 触发阈值
+vad_min_speech_ms: 300            # 短于此的语音段忽略（咳嗽/单字）
+vad_min_silence_ms: 700           # 短静音触发 EOU 试探；EOU 不通过会继续等
+
+# Turn detection (LiveKit EOU model, 基于语义的"说完没"判断)
+eou_threshold: 0.2                # EOU 概率 > 此值 视为说完（intl 模型概率分布偏低，0.5 太严）
+eou_force_end_sec: 4.0            # EOU 持续判定"未说完"的最长等待时间，超过强制处理
+
+# Hallucination filter (general, not hard-coded per phrase)
+rms_min: 0.005                    # 音频能量门限：低于此跳过 Whisper（防 VAD 误触发→幻觉）
+# 下面两层置信度过滤默认禁用（large-v3 对中文短句估计很保守，容易误杀真语音）。
+# 用静音幻觉还是漏过来：先看加不加黑名单，或收紧 rms_min；这两个一般不用动。
+no_speech_max: 1.0                # Whisper 的 no_speech_prob > 此值 视为幻觉 (1.0 = 禁用)
+avg_logprob_min: -10              # Whisper 的平均 logprob < 此值 视为低置信度 (-10 = 禁用)
+
+# 唤醒词检测：必须同时包含 wake_names 中任一名字 + wake_triggers_on/off 中任一触发词
+# （词序无关，所以 "Hi Claude" "Claude 开始" "开始 Cloud" 都行）
+wake_names:
+  - claude
+  - cloud
+  - club
+  - clyde
+  - 克劳德
+  - 克劳
+  - 克鲁
+  - 哥老德
+  - 档        # Whisper 把 "Claude" 听成 "档" 的常见情况
+
+wake_triggers_on:
+  - 开始
+  - 启动
+  - 上线
+  - hi
+  - hey
+  - hello
+  - 你好
+  - 在吗
+
+wake_triggers_off:
+  - 结束
+  - 关闭
+  - 关掉
+  - 关了
+  - 停下
+  - 停止
+  - 拜拜
+  - bye
+  - 再见
+  - 下线
+  - 退下
+
+# 附和词：在 listen_mode 下转录到这些不发给 Claude
+backchannel_words:
+  - 嗯
+  - 嗯嗯
+  - 对
+  - 对对
+  - 好
+  - 好的
+  - 明白
+  - 继续
+  - ok
+  - okay
+
+# Hallucination blacklist (last-resort tier 3 filter).
+# Whisper sometimes outputs YouTube subtitle pollution with HIGH confidence,
+# so confidence checks won't catch them. Substring match after punctuation strip.
+hallucinations:
+  - "明镜与点点"
+  - "Amara.org"
+  - "MING PEI OCT 2006"
+  - "感谢观看"
+  - "感谢您的观看"
+  - "感谢收看"
+  - "下次见"
+  - "下期再见"
+  - "请订阅"
+  - "请点赞"
+  - "记得订阅"
