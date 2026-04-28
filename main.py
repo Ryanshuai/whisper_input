@@ -512,6 +512,13 @@ def handle_speech(audio: np.ndarray):
     elif listen_toggle is False:
         set_listen_mode(False, 'wake word')
     if text_to_chat:
+        # Now that transcription has shown real intent (passed
+        # wake/backchannel/EOU filters), commit to the switch: cancel any
+        # in-flight query from a prior turn so the new one starts clean.
+        # Deferred from VAD-start so noise/coughs don't kill live tasks.
+        if State.claude_busy:
+            print('[barge-in] cancelling prior query for new input')
+            session.cancel_inflight()
         chat(text_to_chat)
 
 
@@ -545,6 +552,9 @@ def turn_watcher_loop():
             continue
         print(f'[EOU forced after {elapsed:.1f}s silence] {text}')
         if State.listen_mode:
+            if State.claude_busy:
+                print('[barge-in] cancelling prior query for new input')
+                session.cancel_inflight()
             chat(text)
 
 
@@ -617,14 +627,18 @@ def audio_loop():
             if event and 'start' in event:
                 in_speech = True
                 buffer = list(pre_roll)
-                # Barge-in: user started speaking → cut off TTS AND cancel the
-                # in-flight Claude query. We're in the audio consumer loop here,
-                # so use the non-blocking stop variant — blocking 500ms on
-                # proc.wait() would stall the mic queue and deform VAD timing.
-                # Assumes user wears headphones (otherwise speaker → mic loop).
+                # Barge-in: stop TTS immediately (cheap, user expects "speaking
+                # → assistant shuts up"). Use non-blocking stop — blocking on
+                # proc.wait() here would stall the mic queue and deform VAD
+                # timing. Assumes headphones (otherwise speaker → mic loop).
+                #
+                # We do NOT cancel the in-flight Claude query yet — VAD start
+                # can fire on noise / coughs / self-talk, and cancelling here
+                # would kill a useful task before we know if this is real
+                # input. The cancel decision is deferred to handle_speech,
+                # after transcription, where we have actual text to inspect.
                 if State.listen_mode:
                     tts.stop_playback_nowait()
-                    session.cancel_inflight()
             elif in_speech:
                 buffer.append(chunk)
 

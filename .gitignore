@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 conversations.jsonl
+perf.jsonl
+.perf-backup/

@@ -65,6 +65,13 @@ _BACKEND: str = 'edge'   # 'edge' | 'qwen3'; set in build_server()
 _playback_proc: Optional[subprocess.Popen] = None
 _playback_lock = threading.Lock()
 
+# In-flight ws producer for the streaming edge path. We track it so
+# stop_playback() can cancel the coroutine — otherwise barge-in would kill
+# ffplay but the producer would keep consuming ws frames until its next
+# stdin.write() fails, leaking a few hundred ms of work per cancel.
+_streaming_task = None  # concurrent.futures.Future | None
+_streaming_lock = threading.Lock()
+
 # Silent MP3 used to pre-wake Bluetooth audio. A2DP power-saves after ~500ms of
 # idle; first real TTS loses its head syllable during device wake. We fire this
 # at chat() entry so by the time Claude finishes generating, the audio path is
@@ -217,6 +224,16 @@ def prewarm():
     threading.Thread(target=_play_audio_if_idle, args=(_SILENCE_MP3,), daemon=True).start()
 
 
+def _cancel_streaming_task():
+    """Cancel the in-flight edge-streaming producer coroutine, if any.
+    Safe no-op when nothing is streaming. Without this, killing ffplay leaves
+    the ws producer consuming frames until its next stdin.write() throws."""
+    with _streaming_lock:
+        task = _streaming_task
+    if task and not task.done():
+        task.cancel()
+
+
 def stop_playback_nowait():
     """Fire-and-forget terminate. Use from latency-sensitive paths like the
     audio_loop's barge-in branch — blocking on proc.wait() there would stall
@@ -227,6 +244,7 @@ def stop_playback_nowait():
         proc = _playback_proc
         if proc and proc.poll() is None:
             proc.terminate()
+    _cancel_streaming_task()
 
 
 def stop_playback():
@@ -237,8 +255,10 @@ def stop_playback():
     with _playback_lock:
         proc = _playback_proc
         if not (proc and proc.poll() is None):
+            _cancel_streaming_task()  # producer may still run even if proc gone
             return
         proc.terminate()
+    _cancel_streaming_task()
     try:
         proc.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
@@ -247,6 +267,79 @@ def stop_playback():
             proc.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
             pass
+
+
+def _play_edge_streaming_blocking(text: str) -> None:
+    """edge-tts streaming playback: pipe ws audio chunks straight into ffplay
+    stdin so playback starts before synthesis finishes. Blocks the calling
+    thread until ffplay exits (natural end OR terminate from stop_playback).
+
+    Why streaming matters: edge-tts.Communicate(...).stream() yields audio
+    chunks as they arrive from the MS service. The previous batched impl
+    awaited all chunks into a bytes buffer before any playback could start,
+    so first-audio latency = full-synth latency (measured 700ms-3.7s by text
+    length). Streaming brings first-audio down to ~one ws frame (300-500ms
+    floor from connection setup, then incremental).
+
+    Cancellation contract:
+    - stop_playback*() terminates ffplay; the producer's next stdin.write
+      raises BrokenPipeError and exits.
+    - stop_playback*() also calls _cancel_streaming_task() so a producer
+      currently awaiting ws.stream() (rather than writing) gets dropped
+      immediately instead of leaking a frame's worth of work.
+    """
+    global _playback_proc, _streaming_task
+
+    rate = f'{TTSState.rate_pct:+d}%'
+    volume = f'{TTSState.volume_pct:+d}%'
+
+    with _playback_lock:
+        if _playback_proc and _playback_proc.poll() is None:
+            _playback_proc.terminate()
+            try:
+                _playback_proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                _playback_proc.kill()
+        _playback_proc = subprocess.Popen(_ffplay_cmd(), stdin=subprocess.PIPE)
+        proc = _playback_proc
+
+    async def producer():
+        try:
+            async for chunk in edge_tts.Communicate(
+                text, TTSState.voice, rate=rate, volume=volume,
+            ).stream():
+                if chunk['type'] != 'audio':
+                    continue
+                try:
+                    proc.stdin.write(chunk['data'])
+                except (BrokenPipeError, OSError):
+                    return  # ffplay was killed (barge-in / next speak)
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f'[TTS edge stream error]: {e}')
+
+    fut = asyncio.run_coroutine_threadsafe(producer(), _tts_loop)
+    with _streaming_lock:
+        _streaming_task = fut
+    try:
+        proc.wait()
+    finally:
+        # Drop the producer if it's still mid-await (e.g. ws hasn't sent the
+        # next frame yet). Cancel is harmless when already finished.
+        if not fut.done():
+            fut.cancel()
+        try:
+            fut.result(timeout=1)
+        except Exception:
+            pass
+        with _streaming_lock:
+            if _streaming_task is fut:
+                _streaming_task = None
 
 
 def _synth_one(text: str) -> bytes:
@@ -304,8 +397,16 @@ def speak(text: str):
     if not text.strip():
         return
 
-    # Edge-tts is fast enough that single-shot is fine. Qwen3 short replies too.
-    if _BACKEND != 'qwen3' or len(text) < _STREAM_MIN_CHARS:
+    # edge-tts: chunk-level streaming for all lengths. ws audio frames are
+    # piped straight into ffplay stdin, so first-audio latency drops to one
+    # frame (~300-500ms ws floor) instead of full-synth latency.
+    if _BACKEND == 'edge':
+        _play_edge_streaming_blocking(text)
+        return
+
+    # qwen3 (local inference): single-shot for short text — chunking < 25 chars
+    # adds per-call overhead with no perceived-latency win.
+    if len(text) < _STREAM_MIN_CHARS:
         try:
             audio = _synth_one(text)
         except Exception as e:
@@ -314,7 +415,7 @@ def speak(text: str):
         _play_audio_blocking(audio)
         return
 
-    # Streamed path: producer thread synthesizes chunks → main thread plays.
+    # qwen3 streamed: producer thread synthesizes chunks → main thread plays.
     chunks = _split_for_streaming(text)
     if len(chunks) == 1:
         try:
