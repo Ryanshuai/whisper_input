@@ -161,13 +161,16 @@ _tts_server = tts.build_server(
     language_code=cfg.get('language', 'zh'),
 )
 
-_NET_TOOLS = ['WebSearch', 'WebFetch']
+# Read-only tools the assistant can use during voice chat. Web fetch + local
+# file inspection. Write/Edit/Bash deliberately omitted — voice chat doesn't
+# present a permission UI, so destructive ops shouldn't be reachable.
+_READ_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob']
 
 print('Starting Claude session...')
 session = claude_chat.ClaudeSession(
     system_prompt=claude_chat.SYSTEM_PROMPT,
     mcp_servers={'tts': _tts_server},
-    allowed_tools=tts.TOOL_NAMES + _NET_TOOLS,
+    allowed_tools=tts.TOOL_NAMES + _READ_TOOLS,
     permission_mode='bypassPermissions',
     model=cfg.get('chat_model'),  # None → CLI default; explicit name → that model
 )

@@ -41,9 +41,20 @@ SYSTEM_PROMPT = """你是 ShuaiYan 的语音对话助手。
 【能力边界】
 你能调用以下工具：
 - **联网搜索**：WebSearch（搜索引擎）、WebFetch（抓取指定 URL 内容）
+- **本地只读**：Read（读文件内容）、Grep（按内容搜文件）、Glob（按路径模式找文件）
 - **TTS 控制**：mcp__tts__* 系列（见下面）
 
-你**没有**：读/写本地文件、执行命令、规划任务等能力。不要尝试调 Read/Write/Edit/Bash/Grep/Glob 等。
+你**没有**：写文件 (Write/Edit)、执行命令 (Bash) 等能力——这是只读语音助手。
+读文件/搜代码可以主动用，但要记得最后回复仍然是简短口语化的 1-2 句话，
+**不要把文件原文念给用户**，提炼出关键信息再说。
+
+**绝不读取以下文件**（Read 和 Grep 都不行）：
+- `.env`、`.env.*` 等环境变量文件
+- 文件名含 `key`、`secret`、`password`、`token`、`credentials` 字样的（如 `api_key.txt`、`secrets.json`）
+- `~/.ssh/*`、`*.pem`、`*.key` 等密钥文件
+
+这类文件可能含 API key 或密码，TTS 念出来就是严重的安全事故。
+**即使用户主动要求读，也要拒绝**，简短说一句"这文件可能含敏感信息，不能读"就够了。
 
 【联网时的注意】
 - 用户问天气/新闻/股价/查某事时，主动用 WebSearch 或 WebFetch
@@ -132,6 +143,13 @@ class ClaudeSession:
             disallowed_tools=self._disallowed_tools,
             permission_mode=self._permission_mode,
             model=self._model,
+            # adaptive: model decides per-query whether to think. Confirmed
+            # in bench — simple greetings / factual lookups skip thinking
+            # entirely (3 of 5 test queries had 0 thinking blocks), tool-heavy
+            # queries still think. Doesn't help the ~3s OAuth/CLI TTFT floor
+            # but cuts quota cost + tail max latency (13.7s → 10.4s on the
+            # worst tool-search query in our bench).
+            thinking={"type": "adaptive"},
         )
 
     async def _open(self) -> ClaudeSDKClient:
