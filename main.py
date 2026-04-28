@@ -153,9 +153,12 @@ border = ScreenBorder()
 
 _tts_server = tts.build_server(
     voices=cfg.get('tts_voices', {}),
-    default_voice=cfg.get('tts_voice', 'zh-CN-XiaoxiaoNeural'),
+    default_voice=cfg.get('tts_voice', 'Ryan'),
     starting_rate_pct=int(cfg.get('tts_rate_pct', 0)),
     starting_volume_pct=int(cfg.get('tts_volume_pct', 0)),
+    backend=cfg.get('tts_backend', 'qwen3'),
+    qwen_model_id=cfg.get('tts_qwen_model_id', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice'),
+    language_code=cfg.get('language', 'zh'),
 )
 
 _NET_TOOLS = ['WebSearch', 'WebFetch']
