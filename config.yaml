@@ -23,18 +23,35 @@ chat_model: claude-opus-4-7
 auto_off_minutes: 5
 log_file: conversations.jsonl     # 本地对话日志（每行一个 user→assistant 记录）
 
+# TTS 后端：edge（微软 edge-tts，云端免费，~300ms 首字延迟）
+#          qwen3（本地 Qwen3-TTS-CustomVoice，1.7B 模型在 RTX 4090/5080 本地推理依然要 3-15s/句，
+#                 不适合实时对话——除非装 flash-attn 并走 streaming 生成 API）
+tts_backend: edge
+tts_qwen_model_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
 # TTS 默认参数
-tts_voice: zh-CN-XiaoyiNeural     # 起始音色：少女音
-tts_rate_pct: 80                  # 语速百分比偏移（-50 到 +100）；+80% ≈ 1.8 倍速
+# edge 音色：zh-CN-XiaoyiNeural / zh-CN-XiaoxiaoNeural / zh-CN-YunxiNeural / zh-CN-YunyangNeural ...
+# qwen3-CustomVoice 9 个 speaker：Vivian / Serena / Uncle_Fu / Dylan / Eric / Ryan / Aiden / Ono_Anna / Sohee
+tts_voice: zh-CN-XiaoyiNeural     # 起始音色（要跟 tts_backend 匹配）
+tts_rate_pct: 80                  # 语速百分比偏移（-50 到 +100）；qwen3 路径用 ffplay atempo 实现，edge 路径走 SSML
 tts_volume_pct: 0                 # 音量百分比偏移（-50 到 +100）
 
-# TTS 音色快捷标签（语音控制时用，可任意扩展）
+# TTS 音色快捷标签（语音控制时用，可任意扩展；按 tts_backend 选一组）
 tts_voices:
+  # --- edge (默认) ---
   female: zh-CN-XiaoxiaoNeural    # 女声温柔
   male: zh-CN-YunxiNeural         # 男声青年
   news: zh-CN-YunyangNeural       # 男声新闻播报
   young_female: zh-CN-XiaoyiNeural   # 女声少女
   young_male: zh-CN-YunxiaNeural     # 男声少年
+  # --- qwen3 (取消注释对应一组使用) ---
+  # female: Vivian
+  # male: Ryan
+  # news: Eric
+  # young_female: Sohee
+  # young_male: Dylan
+  # uncle: Uncle_Fu
+  # serena: Serena
 
 # VAD（粗端点检测，配合下面的 EOU 模型做精判断）
 vad_threshold: 0.5                # silero-vad 触发阈值

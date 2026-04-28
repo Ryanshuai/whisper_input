@@ -1,13 +1,26 @@
-"""TTS: edge-tts synthesis + ffplay playback + MCP tools exposed to Claude.
+"""TTS: edge-tts OR local Qwen3-TTS-CustomVoice + ffplay playback + MCP tools.
 
 This single module owns everything TTS-related:
 - TTSState / SpeakState (mutable runtime state)
 - speak / speak_async (playback API for the rest of the app)
 - 8 MCP tools that let Claude control voice/rate/volume and trigger speak() itself
-- build_server() factory called once during startup
+- build_server() factory called once during startup; picks backend ('edge' or 'qwen3')
+
+Backend differences:
+- edge-tts: free, reverse-engineered MS service. Native rate/volume via SSML
+  percent strings. Returns MP3.
+- qwen3: LOCAL inference of Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice on the same
+  GPU as Whisper. ~6-8GB VRAM in bf16. No native rate/volume params, so we
+  apply rate_pct/volume_pct via ffplay -af filters (atempo + volume). Output
+  is 24kHz WAV bytes (encoded in-memory via soundfile). Model is loaded eagerly
+  in build_server() to avoid 10s+ stall on first speak().
 """
 
 import asyncio
+import io
+import os
+import queue
+import re
 import subprocess
 import threading
 from typing import Optional
@@ -44,6 +57,7 @@ VOLUME_MIN, VOLUME_MAX = -50, 100
 
 _voices: dict = {}
 _default_voice: str = ''
+_BACKEND: str = 'edge'   # 'edge' | 'qwen3'; set in build_server()
 
 
 # --- Playback (edge-tts → ffplay subprocess) ---
@@ -58,7 +72,8 @@ _playback_lock = threading.Lock()
 _SILENCE_MP3: bytes = b''
 
 
-async def _synthesize_mp3(text: str) -> bytes:
+async def _synthesize_edge(text: str) -> bytes:
+    """edge-tts: native rate/volume via SSML percent strings."""
     rate = f'{TTSState.rate_pct:+d}%'
     volume = f'{TTSState.volume_pct:+d}%'
     audio = b''
@@ -70,8 +85,90 @@ async def _synthesize_mp3(text: str) -> bytes:
     return audio
 
 
-def _play_mp3_blocking(mp3: bytes):
-    """Play MP3 via ffplay, blocking until done or terminated."""
+# --- Local Qwen3-TTS model (loaded eagerly in build_server when backend=qwen3) ---
+
+_qwen_model = None        # Qwen3TTSModel instance
+_qwen_lang: str = 'Chinese'  # passed to generate_custom_voice()
+
+# Map config['language'] (whisper-style ISO codes) → Qwen language string.
+_QWEN_LANG_MAP = {
+    'zh': 'Chinese', 'en': 'English', 'ja': 'Japanese', 'ko': 'Korean',
+    'de': 'German', 'fr': 'French', 'ru': 'Russian', 'pt': 'Portuguese',
+    'es': 'Spanish', 'it': 'Italian',
+}
+
+
+def _load_qwen_model(model_id: str, lang_code: str):
+    """Eager-load Qwen3-TTS-CustomVoice. Called from build_server."""
+    global _qwen_model, _qwen_lang
+    print(f'Loading Qwen3-TTS ({model_id}) to GPU... (~3.5GB download first run, ~5-15s load)')
+    import torch
+    from qwen_tts import Qwen3TTSModel
+    try:
+        _qwen_model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map='cuda:0',
+            dtype=torch.bfloat16,
+            attn_implementation='flash_attention_2',
+        )
+    except Exception as e:
+        # FlashAttention2 install fails on Windows often; fall back to sdpa.
+        print(f'[TTS] FlashAttention2 unavailable ({e.__class__.__name__}), falling back to sdpa')
+        _qwen_model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map='cuda:0',
+            dtype=torch.bfloat16,
+            attn_implementation='sdpa',
+        )
+    _qwen_lang = _QWEN_LANG_MAP.get(lang_code, 'Chinese')
+    print(f'Qwen3-TTS ready (language={_qwen_lang}, default voice={TTSState.voice})')
+
+
+def _synthesize_qwen(text: str) -> bytes:
+    """Local Qwen3-TTS-CustomVoice inference. Returns 24kHz WAV bytes.
+    Rate/volume applied at playback time via ffplay -af, not here.
+    """
+    if _qwen_model is None:
+        raise RuntimeError('Qwen3-TTS model not loaded; check build_server output for errors')
+    import soundfile as sf
+    wavs, sr = _qwen_model.generate_custom_voice(
+        text=text,
+        language=_qwen_lang,
+        speaker=TTSState.voice,
+    )
+    buf = io.BytesIO()
+    sf.write(buf, wavs[0], sr, format='WAV', subtype='PCM_16')
+    return buf.getvalue()
+
+
+def _ffplay_audio_filter() -> Optional[str]:
+    """For qwen backend, encode rate_pct/volume_pct as ffplay -af filter chain.
+    Edge backend bakes them into the SSML, so returns None there.
+    rate_pct -50..+100 → atempo 0.5..2.0; volume_pct same mapping.
+    """
+    if _BACKEND != 'qwen3':
+        return None
+    speed = (100 + TTSState.rate_pct) / 100.0
+    volume = (100 + TTSState.volume_pct) / 100.0
+    parts = []
+    if abs(speed - 1.0) > 0.01:
+        parts.append(f'atempo={speed:.2f}')
+    if abs(volume - 1.0) > 0.01:
+        parts.append(f'volume={volume:.2f}')
+    return ','.join(parts) if parts else None
+
+
+def _ffplay_cmd() -> list:
+    cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']
+    af = _ffplay_audio_filter()
+    if af:
+        cmd.extend(['-af', af])
+    cmd.append('-')
+    return cmd
+
+
+def _play_audio_blocking(audio: bytes):
+    """Play audio bytes (mp3/wav, ffplay auto-detects), blocking until done."""
     global _playback_proc
     with _playback_lock:
         if _playback_proc and _playback_proc.poll() is None:
@@ -80,33 +177,29 @@ def _play_mp3_blocking(mp3: bytes):
                 _playback_proc.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 _playback_proc.kill()
-        _playback_proc = subprocess.Popen(
-            ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', '-'],
-            stdin=subprocess.PIPE,
-        )
+        _playback_proc = subprocess.Popen(_ffplay_cmd(), stdin=subprocess.PIPE)
         proc = _playback_proc
     try:
-        proc.stdin.write(mp3)
+        proc.stdin.write(audio)
         proc.stdin.close()
     except (BrokenPipeError, OSError):
         return
     proc.wait()
 
 
-def _play_mp3_if_idle(mp3: bytes):
-    """Play MP3 only if nothing is currently playing. Used by prewarm — we
-    must not stomp on real TTS if speak() happens to beat us to the lock."""
+def _play_audio_if_idle(audio: bytes):
+    """Play only if nothing is currently playing. Used by prewarm — must not
+    stomp on real TTS if speak() happens to beat us to the lock."""
     global _playback_proc
     with _playback_lock:
         if _playback_proc and _playback_proc.poll() is None:
             return
-        _playback_proc = subprocess.Popen(
-            ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', '-'],
-            stdin=subprocess.PIPE,
-        )
+        # Prewarm uses silent MP3 with no filters needed, but go through the
+        # same builder for consistency. atempo on silence is harmless.
+        _playback_proc = subprocess.Popen(_ffplay_cmd(), stdin=subprocess.PIPE)
         proc = _playback_proc
     try:
-        proc.stdin.write(mp3)
+        proc.stdin.write(audio)
         proc.stdin.close()
     except (BrokenPipeError, OSError):
         return
@@ -117,11 +210,11 @@ def prewarm():
     """Fire silent audio now so Bluetooth A2DP is awake when real TTS arrives.
     Call at chat() entry — by the time Claude finishes generating (500ms+),
     the audio path is up and the first syllable of the real reply is preserved.
-    Real speak() replaces this via _play_mp3_blocking's terminate-old logic.
+    Real speak() replaces this via _play_audio_blocking's terminate-old logic.
     """
     if not _SILENCE_MP3:
         return
-    threading.Thread(target=_play_mp3_if_idle, args=(_SILENCE_MP3,), daemon=True).start()
+    threading.Thread(target=_play_audio_if_idle, args=(_SILENCE_MP3,), daemon=True).start()
 
 
 def stop_playback_nowait():
@@ -156,19 +249,102 @@ def stop_playback():
             pass
 
 
+def _synth_one(text: str) -> bytes:
+    """Synthesize a single chunk with the active backend."""
+    if _BACKEND == 'qwen3':
+        return _synthesize_qwen(text)
+    fut = asyncio.run_coroutine_threadsafe(_synthesize_edge(text), _tts_loop)
+    return fut.result(timeout=15)
+
+
+# Sentence boundary: split AFTER terminal punctuation (zh + en).
+# Comma/semicolon also break — long Claude replies often have one giant comma-
+# separated clause; chunking on commas gets first-audio out faster.
+_SENT_SPLIT = re.compile(r'(?<=[。！？!?；;，,])\s*')
+
+# Min chunk length: avoid synthesizing single-char fragments (overhead per call
+# on Qwen3-TTS is ~500ms regardless of text length).
+_MIN_CHUNK_CHARS = 8
+
+# Only stream when total text exceeds this — short replies (e.g. "我在", "好的")
+# pay overhead with no perceived-latency benefit from chunking.
+_STREAM_MIN_CHARS = 25
+
+
+def _split_for_streaming(text: str) -> list:
+    """Split text into chunks for streamed synthesis. Merges fragments shorter
+    than _MIN_CHUNK_CHARS into the next chunk so we don't fire tiny synth calls.
+    """
+    parts = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
+    if not parts:
+        return [text]
+    merged = []
+    buf = ''
+    for p in parts:
+        buf = (buf + p) if buf else p
+        if len(buf) >= _MIN_CHUNK_CHARS:
+            merged.append(buf)
+            buf = ''
+    if buf:
+        if merged:
+            merged[-1] = merged[-1] + buf  # tail too short → glue to last
+        else:
+            merged.append(buf)
+    return merged
+
+
 def speak(text: str):
-    """Synthesize and play `text`. Blocks calling thread until playback finishes."""
+    """Synthesize and play `text`. Blocks calling thread until playback finishes.
+
+    For long text on the qwen3 backend (slow local inference), streams chunks:
+    splits on punctuation, synthesizes sentence-by-sentence, and starts playing
+    the first chunk while later chunks are still being generated. Cuts perceived
+    first-audio latency from "wait for full synth" to "wait for first sentence".
+    """
     if not text.strip():
         return
-    try:
-        # Use the persistent loop so edge-tts can re-use its aiohttp session;
-        # avoids ~200-300ms loop-startup overhead on short replies like "好".
-        fut = asyncio.run_coroutine_threadsafe(_synthesize_mp3(text), _tts_loop)
-        mp3 = fut.result(timeout=15)
-    except Exception as e:
-        print(f'[TTS synth error]: {e}')
+
+    # Edge-tts is fast enough that single-shot is fine. Qwen3 short replies too.
+    if _BACKEND != 'qwen3' or len(text) < _STREAM_MIN_CHARS:
+        try:
+            audio = _synth_one(text)
+        except Exception as e:
+            print(f'[TTS synth error]: {e}')
+            return
+        _play_audio_blocking(audio)
         return
-    _play_mp3_blocking(mp3)
+
+    # Streamed path: producer thread synthesizes chunks → main thread plays.
+    chunks = _split_for_streaming(text)
+    if len(chunks) == 1:
+        try:
+            audio = _synth_one(chunks[0])
+        except Exception as e:
+            print(f'[TTS synth error]: {e}')
+            return
+        _play_audio_blocking(audio)
+        return
+
+    audio_q: queue.Queue = queue.Queue(maxsize=4)
+    _SENTINEL = object()
+
+    def producer():
+        for ch in chunks:
+            try:
+                audio = _synth_one(ch)
+            except Exception as e:
+                print(f'[TTS synth chunk error]: {e}')
+                break
+            audio_q.put(audio)
+        audio_q.put(_SENTINEL)
+
+    threading.Thread(target=producer, daemon=True).start()
+
+    while True:
+        item = audio_q.get()
+        if item is _SENTINEL:
+            return
+        _play_audio_blocking(item)
 
 
 def speak_async(text: str):
@@ -303,15 +479,26 @@ TOOL_NAMES = [
 
 
 def build_server(voices: dict, default_voice: str,
-                 starting_rate_pct: int = 0, starting_volume_pct: int = 0):
+                 starting_rate_pct: int = 0, starting_volume_pct: int = 0,
+                 backend: str = 'qwen3',
+                 qwen_model_id: str = 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
+                 language_code: str = 'zh'):
     """Initialize TTS state and create MCP server. Call once during startup."""
-    global _voices, _default_voice, _SILENCE_MP3
+    global _voices, _default_voice, _SILENCE_MP3, _BACKEND
     _voices = dict(voices)
     _default_voice = default_voice
+    _BACKEND = backend if backend in ('edge', 'qwen3') else 'edge'
 
     TTSState.voice = default_voice
     TTSState.rate_pct = int(starting_rate_pct)
     TTSState.volume_pct = int(starting_volume_pct)
+
+    if _BACKEND == 'qwen3':
+        try:
+            _load_qwen_model(qwen_model_id, language_code)
+        except Exception as e:
+            print(f'[TTS] FATAL: Qwen3-TTS load failed ({e}); speak() will error. '
+                  f'To fall back to edge-tts: set tts_backend: edge in config.yaml')
 
     try:
         _SILENCE_MP3 = subprocess.run(

@@ -27,6 +27,11 @@ ctranslate2 = ">=4.5,<4.8"
 faster-whisper = "*"
 silero-vad = "*"
 edge-tts = "*"
+qwen-tts = "*"            # 本地 Qwen3-TTS 推理
+# torch 必须从 cu128 index 装才支持 Blackwell (RTX 50 系列)；qwen-tts 默认拉的是 CPU 版
+torch = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+soundfile = "*"           # numpy → WAV bytes
 claude-agent-sdk = "*"
 tokenizers = "*"          # 轻量 Rust tokenizer，避免拉 torch
 huggingface-hub = "*"     # model download
