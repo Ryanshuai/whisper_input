@@ -37,18 +37,24 @@ def transcribe(
     initial_prompt: str | None = None,
     hotwords: str | None = None,
     condition_on_previous_text: bool = False,
-    temperature: float = 0.0,
+    temperature: float | list[float] = 0.0,
     vad_filter: bool = False,
     rms_min: float = 0.005,
     no_speech_max: float = 1.0,
     avg_logprob_min: float = -10.0,
     hallucinations: list[str] = (),
+    force: bool = False,
 ) -> str:
     """Transcribe audio. Returns '' if filtered out by any layer.
 
     `hallucinations` should be a list of pre-stripped (via strip_punct) phrases.
+
+    When `force=True`, only the RMS silence gate is applied; the Whisper
+    confidence checks and the hallucination blacklist are skipped. Use this for
+    user-initiated dictation where pressing the hotkey is itself a signal that
+    real speech is expected and false-positive filtering does more harm than good.
     """
-    # Layer 1: RMS gate
+    # Layer 1: RMS gate (always on — even forced dictation shouldn't paste silence)
     rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
     if rms < rms_min:
         return ''
@@ -66,22 +72,24 @@ def transcribe(
     if not segs:
         return ''
 
-    # Layer 2: Whisper's own confidence signals
-    no_speech = float(np.mean([s.no_speech_prob for s in segs]))
-    avg_logp = float(np.mean([s.avg_logprob for s in segs]))
-    if no_speech > no_speech_max:
-        print(f'[low conf] no_speech_prob={no_speech:.2f} skipped')
-        return ''
-    if avg_logp < avg_logprob_min:
-        print(f'[low conf] avg_logprob={avg_logp:.2f} skipped')
-        return ''
+    if not force:
+        # Layer 2: Whisper's own confidence signals
+        no_speech = float(np.mean([s.no_speech_prob for s in segs]))
+        avg_logp = float(np.mean([s.avg_logprob for s in segs]))
+        if no_speech > no_speech_max:
+            print(f'[low conf] no_speech_prob={no_speech:.2f} skipped')
+            return ''
+        if avg_logp < avg_logprob_min:
+            print(f'[low conf] avg_logprob={avg_logp:.2f} skipped')
+            return ''
 
     text = ''.join(s.text for s in segs).strip()
 
-    # Layer 3: explicit blacklist (high-confidence training-data pollution)
-    text_check = strip_punct(text)
-    for h in hallucinations:
-        if h and h in text_check:
-            print(f'[blacklist] matched "{h}" skipped')
-            return ''
+    if not force:
+        # Layer 3: explicit blacklist (high-confidence training-data pollution)
+        text_check = strip_punct(text)
+        for h in hallucinations:
+            if h and h in text_check:
+                print(f'[blacklist] matched "{h}" skipped')
+                return ''
     return text

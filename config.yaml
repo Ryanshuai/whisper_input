@@ -3,7 +3,7 @@ model: large-v3
 device: cuda
 compute_type: float16
 language: zh
-temperature: 0.0
+temperature: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # fallback: T=0 卡进无语音/重复死路时，自动升温重采样
 initial_prompt: "以下是普通话和英语的句子。"
 hotwords: "Claude"  # faster-whisper 词偏置：引导识别成 Claude 而不是 Cloud（不会被吐进转录结果）
 condition_on_previous_text: false

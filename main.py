@@ -405,9 +405,9 @@ def stop_dictation():
     if duration < 0.3:
         print('  too short, skipped')
         return
-    text = _transcribe(audio)
+    text = _transcribe(audio, force=True)
     if not text:
-        print('  (empty/hallucination)')
+        print('  (empty)')
         return
     print(f'[Dictation] {text}')
     pyperclip.copy(text)
@@ -427,7 +427,7 @@ def toggle_dictation():
 
 # ---------------- Transcription wrapper (passes config to asr.transcribe) ----------------
 
-def _transcribe(audio: np.ndarray) -> str:
+def _transcribe(audio: np.ndarray, force: bool = False) -> str:
     return asr.transcribe(
         whisper, audio,
         language=cfg.get('language'),
@@ -440,6 +440,7 @@ def _transcribe(audio: np.ndarray) -> str:
         no_speech_max=cfg.get('no_speech_max', 1.0),
         avg_logprob_min=cfg.get('avg_logprob_min', -10),
         hallucinations=HALLUCINATIONS,
+        force=force,
     )
 
 
@@ -593,8 +594,16 @@ def audio_loop():
                     threading.Thread(target=stop_dictation, daemon=True).start()
 
     with sd.InputStream(samplerate=SR, channels=1, dtype='float32',
-                        blocksize=chunk_samples, callback=cb):
-        print('\n[Audio] Listening on default input device.')
+                        blocksize=chunk_samples, callback=cb) as _stream:
+        try:
+            _dev_idx = _stream.device if isinstance(_stream.device, int) else _stream.device[0]
+            _dev = sd.query_devices(_dev_idx)
+            _host = sd.query_hostapis(_dev['hostapi'])['name']
+            print(f"\n[Audio] Listening on: [{_dev_idx}] {_dev['name']} "
+                  f"({_host}, native_sr={int(_dev['default_samplerate'])}, "
+                  f"in_ch={_dev['max_input_channels']}) -> resampled to {SR}Hz mono")
+        except Exception as _e:
+            print(f"\n[Audio] Listening on default input device. (query failed: {_e})")
         while True:
             # Flush VAD pipeline if requested (dictation start/stop).
             if _audio_reset_request.is_set():
