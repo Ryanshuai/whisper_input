@@ -63,6 +63,30 @@ with open(os.path.join(os.path.dirname(__file__), 'config.yaml'), encoding='utf-
     cfg = yaml.safe_load(f)
 
 SR = cfg.get('sample_rate', 16000)
+
+# Some Linux mics (raw ALSA hw: devices, when portaudio is built without the
+# pulse/pipewire plug backends — e.g. conda-forge's portaudio) reject 16kHz
+# capture because the hardware only supports 44.1/48k. Probe; if SR isn't
+# accepted, fall back to a native rate and resample in the audio callback.
+try:
+    sd.check_input_settings(channels=1, samplerate=SR, dtype='float32')
+    HW_SR = SR
+except Exception:
+    HW_SR = 0
+    for _cand in (48000, 44100, 32000, 22050):
+        try:
+            sd.check_input_settings(channels=1, samplerate=_cand, dtype='float32')
+            HW_SR = _cand
+            break
+        except Exception:
+            continue
+    if not HW_SR:
+        raise RuntimeError(
+            f'No supported input sample rate found '
+            f'(tried {SR}, 48000, 44100, 32000, 22050). '
+            f'Check your audio device.'
+        )
+    print(f'[Audio] Mic does not support {SR} Hz natively; capturing at {HW_SR} Hz and resampling.')
 HALLUCINATIONS = [asr.strip_punct(h) for h in cfg.get('hallucinations', []) if h.strip()]
 WAKE_NAMES = [w.lower() for w in cfg.get('wake_names', [])]
 WAKE_TRIGGERS_ON = [w.lower() for w in cfg.get('wake_triggers_on', [])]
@@ -386,7 +410,7 @@ def start_dictation():
 
 def stop_dictation():
     # test-and-set inside the lock so a concurrent caller (e.g. audio cb's
-    # auto-stop on max-duration + user pressing F13 simultaneously) can't both
+    # auto-stop on max-duration + user pressing Pause simultaneously) can't both
     # observe active=True and end up double-pasting.
     with Dict_.lock:
         if not Dict_.active:
@@ -581,20 +605,41 @@ def audio_loop():
     q: list = []
     q_lock = threading.Lock()
 
-    def cb(indata, *_):
-        chunk = indata[:, 0].copy()
-        with q_lock:
-            q.append(chunk)
-        if Dict_.active:
-            with Dict_.lock:
-                Dict_.chunks.append(chunk)
-                if time.time() - Dict_.started_at > DICT_MAX_SEC:
-                    # Defer the actual stop_dictation work to a worker thread —
-                    # don't run paste / Whisper inside the audio callback.
-                    threading.Thread(target=stop_dictation, daemon=True).start()
+    # If the mic can't capture at SR (16k) natively, capture at HW_SR and
+    # streaming-resample to SR inside the callback. soxr.ResampleStream keeps
+    # filter state across calls, so variable input block sizes are fine.
+    need_resample = (HW_SR != SR)
+    if need_resample:
+        import soxr
+        resampler = soxr.ResampleStream(HW_SR, SR, 1, dtype='float32', quality='HQ')
 
-    with sd.InputStream(samplerate=SR, channels=1, dtype='float32',
-                        blocksize=chunk_samples, callback=cb) as _stream:
+    scratch = [np.empty(0, dtype=np.float32)]  # leftover 16k samples between callbacks
+
+    def cb(indata, *_):
+        in_samples = indata[:, 0]
+        if need_resample:
+            out_samples = resampler.resample_chunk(in_samples)
+        else:
+            out_samples = in_samples.copy()
+        if len(out_samples) == 0:
+            return
+        scratch[0] = np.concatenate([scratch[0], out_samples])
+        while len(scratch[0]) >= chunk_samples:
+            chunk = scratch[0][:chunk_samples].copy()
+            scratch[0] = scratch[0][chunk_samples:]
+            with q_lock:
+                q.append(chunk)
+            if Dict_.active:
+                with Dict_.lock:
+                    Dict_.chunks.append(chunk)
+                    if time.time() - Dict_.started_at > DICT_MAX_SEC:
+                        # Defer the actual stop_dictation work to a worker thread —
+                        # don't run paste / Whisper inside the audio callback.
+                        threading.Thread(target=stop_dictation, daemon=True).start()
+
+    hw_blocksize = chunk_samples if not need_resample else int(round(chunk_samples * HW_SR / SR))
+    with sd.InputStream(samplerate=HW_SR, channels=1, dtype='float32',
+                        blocksize=hw_blocksize, callback=cb) as _stream:
         try:
             _dev_idx = _stream.device if isinstance(_stream.device, int) else _stream.device[0]
             _dev = sd.query_devices(_dev_idx)

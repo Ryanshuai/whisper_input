@@ -11,7 +11,7 @@ vad_filter: false  # 我们用外部 silero-vad 流式切片
 
 # Hotkeys
 activation_key:                   # 留空：禁用对话模式快捷键，只靠语音唤醒词「Claude 开始/关闭」
-dictation_key: f13                # F13 = 语音输入模式（转录后粘贴到当前应用）
+dictation_key: pause              # Pause 键 = 语音输入模式（转录后粘贴到当前应用）
 dictation_press_enter: true       # 语音输入完成后是否自动按回车提交
 sample_rate: 16000
 
