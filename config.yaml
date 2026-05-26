@@ -16,6 +16,9 @@ dictation_press_enter: true       # 语音输入完成后是否自动按回车�
 sample_rate: 16000
 
 # Conversation
+# false = 纯听写模式：只加载 Whisper + 启用 Pause 听写热键，跳过 EOU/TTS/Claude session。
+# true = 完整对话模式（唤醒词 + 对话快捷键 + TTS + Claude）。
+enable_claude: false
 # 走订阅 quota 时模型选最聪明的就行：opus > sonnet > haiku。
 # 模型 ID: claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
 # 留空 = 用 Claude Code CLI 的默认模型。

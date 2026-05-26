@@ -87,6 +87,7 @@ except Exception:
             f'Check your audio device.'
         )
     print(f'[Audio] Mic does not support {SR} Hz natively; capturing at {HW_SR} Hz and resampling.')
+CLAUDE_ENABLED = bool(cfg.get('enable_claude', True))
 HALLUCINATIONS = [asr.strip_punct(h) for h in cfg.get('hallucinations', []) if h.strip()]
 WAKE_NAMES = [w.lower() for w in cfg.get('wake_names', [])]
 WAKE_TRIGGERS_ON = [w.lower() for w in cfg.get('wake_triggers_on', [])]
@@ -101,12 +102,16 @@ LOG_PATH = os.path.join(os.path.dirname(__file__), cfg.get('log_file', 'conversa
 whisper = asr.load_whisper(cfg['model'], cfg['device'], cfg['compute_type'])
 vad_model = asr.load_vad()
 
-print('Loading turn-detector (LiveKit EOU model, ~400MB, first run downloads)...')
-eou = EouDetector(
-    threshold=float(cfg.get('eou_threshold', 0.2)),
-    force_end_sec=float(cfg.get('eou_force_end_sec', 4.0)),
-)
-print(f'EOU ready (threshold={eou.threshold}, force_end={eou.force_end_sec}s)')
+if CLAUDE_ENABLED:
+    print('Loading turn-detector (LiveKit EOU model, ~400MB, first run downloads)...')
+    eou = EouDetector(
+        threshold=float(cfg.get('eou_threshold', 0.2)),
+        force_end_sec=float(cfg.get('eou_force_end_sec', 4.0)),
+    )
+    print(f'EOU ready (threshold={eou.threshold}, force_end={eou.force_end_sec}s)')
+else:
+    eou = None
+    print('[Claude disabled] dictation-only mode — skipping EOU/TTS/Claude session.')
 
 
 # ---------------- ScreenBorder UI ----------------
@@ -175,31 +180,34 @@ border = ScreenBorder()
 
 # ---------------- TTS server + Claude session ----------------
 
-_tts_server = tts.build_server(
-    voices=cfg.get('tts_voices', {}),
-    default_voice=cfg.get('tts_voice', 'Ryan'),
-    starting_rate_pct=int(cfg.get('tts_rate_pct', 0)),
-    starting_volume_pct=int(cfg.get('tts_volume_pct', 0)),
-    backend=cfg.get('tts_backend', 'qwen3'),
-    qwen_model_id=cfg.get('tts_qwen_model_id', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice'),
-    language_code=cfg.get('language', 'zh'),
-)
+if CLAUDE_ENABLED:
+    _tts_server = tts.build_server(
+        voices=cfg.get('tts_voices', {}),
+        default_voice=cfg.get('tts_voice', 'Ryan'),
+        starting_rate_pct=int(cfg.get('tts_rate_pct', 0)),
+        starting_volume_pct=int(cfg.get('tts_volume_pct', 0)),
+        backend=cfg.get('tts_backend', 'qwen3'),
+        qwen_model_id=cfg.get('tts_qwen_model_id', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice'),
+        language_code=cfg.get('language', 'zh'),
+    )
 
-# Read-only tools the assistant can use during voice chat. Web fetch + local
-# file inspection. Write/Edit/Bash deliberately omitted — voice chat doesn't
-# present a permission UI, so destructive ops shouldn't be reachable.
-_READ_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob']
+    # Read-only tools the assistant can use during voice chat. Web fetch + local
+    # file inspection. Write/Edit/Bash deliberately omitted — voice chat doesn't
+    # present a permission UI, so destructive ops shouldn't be reachable.
+    _READ_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob']
 
-print('Starting Claude session...')
-session = claude_chat.ClaudeSession(
-    system_prompt=claude_chat.SYSTEM_PROMPT,
-    mcp_servers={'tts': _tts_server},
-    allowed_tools=tts.TOOL_NAMES + _READ_TOOLS,
-    permission_mode='bypassPermissions',
-    model=cfg.get('chat_model'),  # None → CLI default; explicit name → that model
-)
-session.start()
-print('Claude SDK ready (uses local claude CLI OAuth, no API key needed).')
+    print('Starting Claude session...')
+    session = claude_chat.ClaudeSession(
+        system_prompt=claude_chat.SYSTEM_PROMPT,
+        mcp_servers={'tts': _tts_server},
+        allowed_tools=tts.TOOL_NAMES + _READ_TOOLS,
+        permission_mode='bypassPermissions',
+        model=cfg.get('chat_model'),  # None → CLI default; explicit name → that model
+    )
+    session.start()
+    print('Claude SDK ready (uses local claude CLI OAuth, no API key needed).')
+else:
+    session = None
 
 
 # ---------------- Conversation state + log ----------------
@@ -477,6 +485,8 @@ _handle_speech_lock = threading.Lock()
 
 
 def handle_speech(audio: np.ndarray):
+    if not CLAUDE_ENABLED:
+        return
     if Dict_.active:
         # Dictation owns the mic; don't route VAD-segmented audio anywhere
         return
@@ -722,10 +732,11 @@ def on_chat_hotkey():
 # ---------------- Main ----------------
 
 def _shutdown(*_):
-    try:
-        tts.stop_playback()
-    except Exception:
-        pass
+    if CLAUDE_ENABLED:
+        try:
+            tts.stop_playback()
+        except Exception:
+            pass
     os._exit(0)
 
 
@@ -734,17 +745,19 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, _shutdown)
 
     threading.Thread(target=audio_loop, daemon=True).start()
-    threading.Thread(target=auto_off_loop, daemon=True).start()
-    threading.Thread(target=turn_watcher_loop, daemon=True).start()
+    if CLAUDE_ENABLED:
+        threading.Thread(target=auto_off_loop, daemon=True).start()
+        threading.Thread(target=turn_watcher_loop, daemon=True).start()
 
-    combo_chat = cfg.get('activation_key') or ''
+    combo_chat = cfg.get('activation_key') or '' if CLAUDE_ENABLED else ''
     combo_dict = cfg.get('dictation_key') or ''
     hotkey_chat = getattr(Key, combo_chat.lower()) if combo_chat else None
     hotkey_dict = getattr(Key, combo_dict.lower()) if combo_dict else None
     print('\nReady.')
     if hotkey_chat:
         print(f'  [{combo_chat}] toggle 对话模式 (Claude)')
-    print('  对话模式语音切换：说 "Claude 开始" / "Claude 关闭"')
+    if CLAUDE_ENABLED:
+        print('  对话模式语音切换：说 "Claude 开始" / "Claude 关闭"')
     if hotkey_dict:
         print(f'  [{combo_dict}] toggle 语音输入模式 (transcribe → paste)')
 
