@@ -1,7 +1,7 @@
 # Whisper
 model: large-v3
 device: cuda
-compute_type: float16
+compute_type: int8_float16   # 权重 int8、激活 fp16：显存从 ~4GB 砍到 ~1.5GB，中文质量几乎无损（训练同卡时让路用）
 language: zh
 temperature: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # fallback: T=0 卡进无语音/重复死路时，自动升温重采样
 initial_prompt: "以下是普通话和英语的句子。"
