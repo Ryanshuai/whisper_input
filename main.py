@@ -12,6 +12,25 @@ Owns the runtime state machine, audio loop, hotkey handlers, and dictation mode.
 import os
 import sys
 
+# On Linux, conda-forge's portaudio is ALSA-only and misses capture devices
+# behind PipeWire/PulseAudio.  Override ctypes.util.find_library so that
+# sounddevice loads the system libportaudio (which has JACK backend support).
+# Combined with pw-jack, this lets portaudio see all PipeWire sources.
+if sys.platform == 'linux':
+    import glob as _glob, shutil as _shutil
+    _sys_pa = next(iter(sorted(
+        _glob.glob('/usr/lib/*/libportaudio.so*'))), None)
+    if _sys_pa:
+        import ctypes.util as _ctu
+        _orig_find = _ctu.find_library
+        _ctu.find_library = lambda name, _o=_orig_find: (
+            _sys_pa if name == 'portaudio' else _o(name))
+    if '_PW_JACK_DONE' not in os.environ:
+        _pw_jack = _shutil.which('pw-jack')
+        if _pw_jack:
+            os.environ['_PW_JACK_DONE'] = '1'
+            os.execv(_pw_jack, [_pw_jack, sys.executable] + sys.argv)
+
 # Pre-load ctranslate2 DLLs on Windows (pixi env needs explicit DLL paths)
 if sys.platform == 'win32':
     import ctypes
@@ -63,6 +82,31 @@ with open(os.path.join(os.path.dirname(__file__), 'config.yaml'), encoding='utf-
     cfg = yaml.safe_load(f)
 
 SR = cfg.get('sample_rate', 16000)
+
+# Allow config to specify input device by index or substring of device name.
+_input_dev = cfg.get('input_device')
+if _input_dev is not None:
+    if isinstance(_input_dev, int):
+        sd.default.device = (_input_dev, sd.default.device[1])
+        print(f'[Audio] Config selected input device index: {_input_dev}')
+    else:
+        _needle = str(_input_dev).lower()
+        for _d in sd.query_devices():
+            if _d['max_input_channels'] > 0 and _needle in _d['name'].lower():
+                sd.default.device = (_d['index'], sd.default.device[1])
+                print(f'[Audio] Config matched input device: {_d["name"]}')
+                break
+        else:
+            print(f'[Audio] WARNING: no input device matching "{_input_dev}" found, using default.')
+
+# When JACK backend is active (e.g. via pw-jack), the default input device may
+# be -1 (unset).  Auto-select the first available input device.
+if sd.default.device[0] == -1:
+    for _d in sd.query_devices():
+        if _d['max_input_channels'] > 0:
+            sd.default.device = (_d['index'], sd.default.device[1])
+            print(f'[Audio] Auto-selected input device: {_d["name"]}')
+            break
 
 # Some Linux mics (raw ALSA hw: devices, when portaudio is built without the
 # pulse/pipewire plug backends — e.g. conda-forge's portaudio) reject 16kHz
