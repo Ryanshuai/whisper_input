@@ -1,7 +1,7 @@
 """whisper-writer entry point.
 
 Glue layer that wires together:
-  asr.py         — Whisper transcription
+  asr.py         — pluggable ASR (faster_whisper | qwen3_asr)
   eou.py         — semantic end-of-utterance detection
   tts.py         — TTS playback + MCP tools exposed to Claude
   claude_chat.py — Claude SDK session
@@ -161,7 +161,7 @@ LOG_PATH = os.path.join(os.path.dirname(__file__), cfg.get('log_file', 'conversa
 
 # ---------------- Models ----------------
 
-whisper = asr.load_whisper(cfg['model'], cfg['device'], cfg['compute_type'])
+asr_backend = asr.load_backend(cfg, HALLUCINATIONS)
 vad_model = asr.load_vad()
 
 if CLAUDE_ENABLED:
@@ -179,11 +179,21 @@ else:
 # ---------------- ScreenBorder UI ----------------
 
 class ScreenBorder:
-    """Thin border around all screens; color = current state."""
+    """Thin border around all screens; color = current state.
+
+    Thread-safe: show()/hide() only assign a desired-state field. All Tk calls
+    run on the Tk thread via a self-scheduled poll loop, because Tkinter is not
+    safe to call from other threads — cross-thread `.after()` can deadlock (which
+    wedged stop_dictation before it reached transcription).
+    """
+
+    _MISSING = object()
 
     def __init__(self, width=3):
         self._width = width
         self._bars = []
+        self._desired = None            # None = hidden; else color string
+        self._applied = self._MISSING   # last state actually pushed to Tk
         self._ready = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait()
@@ -226,15 +236,26 @@ class ScreenBorder:
             self._bars.append(bar)
 
         self._ready.set()
+        self._poll()            # apply desired-state changes on the Tk thread
         self._tk.mainloop()
 
+    def _poll(self):
+        d = self._desired
+        if d is not self._applied:
+            self._applied = d
+            for bar in self._bars:
+                if d is None:
+                    bar.withdraw()
+                else:
+                    bar.configure(bg=d)
+                    bar.deiconify()
+        self._tk.after(30, self._poll)
+
     def show(self, color):
-        for bar in self._bars:
-            bar.after(0, lambda b=bar, c=color: (b.configure(bg=c), b.deiconify()))
+        self._desired = color   # applied by _poll on the Tk thread
 
     def hide(self):
-        for bar in self._bars:
-            bar.after(0, bar.withdraw)
+        self._desired = None
 
 
 border = ScreenBorder()
@@ -589,26 +610,10 @@ def toggle_dictation():
         start_dictation()
 
 
-# ---------------- Transcription wrapper (passes config to asr.transcribe) ----------------
+# ---------------- Transcription wrapper ----------------
 
 def _transcribe(audio: np.ndarray, force: bool = False, diag: dict | None = None) -> str:
-    return asr.transcribe(
-        whisper, audio,
-        language=cfg.get('language'),
-        initial_prompt=cfg.get('initial_prompt'),
-        hotwords=cfg.get('hotwords'),
-        condition_on_previous_text=cfg.get('condition_on_previous_text', False),
-        temperature=cfg.get('temperature', 0.0),
-        vad_filter=cfg.get('vad_filter', False),
-        vad_threshold=cfg.get('dictation_vad_threshold', 0.6),
-        rms_min=cfg.get('rms_min', 0.005),
-        rms_peak_min=cfg.get('rms_peak_min', 0.005),
-        no_speech_max=cfg.get('no_speech_max', 1.0),
-        avg_logprob_min=cfg.get('avg_logprob_min', -10),
-        hallucinations=HALLUCINATIONS,
-        force=force,
-        diag=diag,
-    )
+    return asr_backend.transcribe(audio, force=force, diag=diag)
 
 
 # ---------------- Speech segment handler (per silero-vad end event) ----------------
@@ -967,10 +972,26 @@ if __name__ == '__main__':
         print(f'  [{combo_dict}] toggle 语音输入模式 (transcribe → paste)')
 
     def on_press(key):
+        # pynput runs on_press inside the Windows low-level keyboard hook; if the
+        # callback blocks past LowLevelHooksTimeout (~300ms) Windows silently drops
+        # the hook and the hotkey dies. Transcription (Qwen3-ASR generate) takes
+        # ~0.8s+, so dispatch handlers to worker threads to keep the hook instant.
+        # start/stop_dictation already guard concurrency via Dict_.lock + test-and-set.
         if hotkey_chat and key == hotkey_chat:
-            on_chat_hotkey()
+            threading.Thread(target=on_chat_hotkey, daemon=True).start()
         elif hotkey_dict and key == hotkey_dict:
-            toggle_dictation()
+            threading.Thread(target=toggle_dictation, daemon=True).start()
 
-    with Listener(on_press=on_press) as listener:
-        listener.join()
+    # Don't block the main thread in listener.join(): on Windows a C-level blocking
+    # call swallows Ctrl+C (SIGINT is only delivered to the main thread between
+    # bytecodes), so the app couldn't be exited. Poll in an interruptible sleep
+    # loop instead — Ctrl+C then reaches _shutdown and exits cleanly.
+    listener = Listener(on_press=on_press)
+    listener.start()
+    try:
+        while listener.running:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()

@@ -1,6 +1,16 @@
-# Whisper
+# ASR 后端选择：
+#   qwen3_asr      — Qwen/Qwen3-ASR-0.6B-hf，中文为主+夹英文词（code-switching）最佳，需 torch+transformers
+#   faster_whisper — CTranslate2 Whisper，torch-free，用下面 # Whisper 段的配置
+backend: qwen3_asr
+
+# --- qwen3_asr backend ---
+qwen_asr_model: Qwen/Qwen3-ASR-1.7B-hf   # 1.7B：实测延迟与 0.6B 几乎相同(~0.8s)，术语更准(如 CUDA)。退回省显存改 0.6B-hf
+qwen_asr_language:            # 留空 = 自动语种检测（中英混合首选）；也可填 Chinese / English 强制
+qwen_asr_max_new_tokens: 256
+
+# Whisper （backend: faster_whisper 时生效）
 model: large-v3
-device: cuda
+device: cuda                 # 两个 backend 共用（qwen3_asr 也读这个）
 compute_type: int8_float16   # 权重 int8、激活 fp16：显存从 ~4GB 砍到 ~1.5GB，中文质量几乎无损（训练同卡时让路用）
 language: zh
 temperature: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # fallback: T=0 卡进无语音/重复死路时，自动升温重采样
