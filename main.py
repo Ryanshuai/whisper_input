@@ -83,54 +83,72 @@ with open(os.path.join(os.path.dirname(__file__), 'config.yaml'), encoding='utf-
 
 SR = cfg.get('sample_rate', 16000)
 
-# Allow config to specify input device by index or substring of device name.
+# Input-device selection is dynamic and self-healing: the audio supervisor
+# (audio_loop) resolves a device on every (re)connect instead of pinning one at
+# import time. That makes the mic robust to USB hot-plug and late enumeration on
+# every platform sounddevice supports — Linux/PipeWire, Windows WASAPI/MME, macOS
+# — because the reconnect trigger is a wall-clock "no-callback" watchdog, not an
+# OS-specific hot-plug event.
 _input_dev = cfg.get('input_device')
-if _input_dev is not None:
+
+# Substrings of device names we never auto-select: phantom capture endpoints with
+# no real mic behind them (HDMI inputs, internal HDA codecs). The configured
+# `input_device` name and any USB-Audio mic still win over this list; it's only a
+# last-resort guard so an empty config never grabs a dead card and records silence.
+# Defaults are Linux/ALSA-flavored names; override via config `input_device_blocklist`.
+_INPUT_BLOCKLIST = tuple(
+    str(s).lower() for s in cfg.get('input_device_blocklist',
+                                    ['hdmi', 'hda nvidia', 'hda intel pch'])
+)
+# Capture rates to try, SR (16k) first. Some mics reject 16k and only do 44.1/48k,
+# in which case audio_loop captures at the native rate and resamples in the callback.
+_SR_CANDIDATES = (SR, 48000, 44100, 32000, 22050)
+
+
+def _list_input_devices():
+    return [d for d in sd.query_devices() if d['max_input_channels'] > 0]
+
+
+def _resolve_input_device():
+    """Pick the best available capture device, or None if none is acceptable.
+
+    Preference order: (1) the device whose name contains the configured
+    `input_device` substring, or matches it as an index; (2) any USB-Audio mic;
+    (3) any input not on the phantom blocklist. Returning None means 'wait for a
+    real mic' — we never fall back to a phantom card that would record silence.
+    """
+    devs = _list_input_devices()
+    if not devs:
+        return None
     if isinstance(_input_dev, int):
-        sd.default.device = (_input_dev, sd.default.device[1])
-        print(f'[Audio] Config selected input device index: {_input_dev}')
-    else:
-        _needle = str(_input_dev).lower()
-        for _d in sd.query_devices():
-            if _d['max_input_channels'] > 0 and _needle in _d['name'].lower():
-                sd.default.device = (_d['index'], sd.default.device[1])
-                print(f'[Audio] Config matched input device: {_d["name"]}')
-                break
-        else:
-            print(f'[Audio] WARNING: no input device matching "{_input_dev}" found, using default.')
+        for d in devs:
+            if d['index'] == _input_dev:
+                return d
+    elif _input_dev:
+        needle = str(_input_dev).lower()
+        for d in devs:
+            if needle in d['name'].lower():
+                return d
+    for d in devs:
+        if 'usb' in d['name'].lower():
+            return d
+    for d in devs:
+        if not any(b in d['name'].lower() for b in _INPUT_BLOCKLIST):
+            return d
+    return None
 
-# When JACK backend is active (e.g. via pw-jack), the default input device may
-# be -1 (unset).  Auto-select the first available input device.
-if sd.default.device[0] == -1:
-    for _d in sd.query_devices():
-        if _d['max_input_channels'] > 0:
-            sd.default.device = (_d['index'], sd.default.device[1])
-            print(f'[Audio] Auto-selected input device: {_d["name"]}')
-            break
 
-# Some Linux mics (raw ALSA hw: devices, when portaudio is built without the
-# pulse/pipewire plug backends — e.g. conda-forge's portaudio) reject 16kHz
-# capture because the hardware only supports 44.1/48k. Probe; if SR isn't
-# accepted, fall back to a native rate and resample in the audio callback.
-try:
-    sd.check_input_settings(channels=1, samplerate=SR, dtype='float32')
-    HW_SR = SR
-except Exception:
-    HW_SR = 0
-    for _cand in (48000, 44100, 32000, 22050):
+def _probe_hw_sr(dev_idx):
+    """Lowest-friction capture rate the device accepts (SR preferred), or None if
+    it supports none of the candidates."""
+    for cand in _SR_CANDIDATES:
         try:
-            sd.check_input_settings(channels=1, samplerate=_cand, dtype='float32')
-            HW_SR = _cand
-            break
+            sd.check_input_settings(device=dev_idx, channels=1,
+                                    samplerate=cand, dtype='float32')
+            return cand
         except Exception:
             continue
-    if not HW_SR:
-        raise RuntimeError(
-            f'No supported input sample rate found '
-            f'(tried {SR}, 48000, 44100, 32000, 22050). '
-            f'Check your audio device.'
-        )
-    print(f'[Audio] Mic does not support {SR} Hz natively; capturing at {HW_SR} Hz and resampling.')
+    return None
 CLAUDE_ENABLED = bool(cfg.get('enable_claude', True))
 HALLUCINATIONS = [asr.strip_punct(h) for h in cfg.get('hallucinations', []) if h.strip()]
 WAKE_NAMES = [w.lower() for w in cfg.get('wake_names', [])]
@@ -446,6 +464,12 @@ _audio_reset_request = threading.Event()
 _kb = KbController()
 
 
+def _t() -> str:
+    """HH:MM:SS stamp for dictation console lines, so they line up with the
+    timestamps in dictation_log.tsv."""
+    return datetime.now().strftime('%H:%M:%S')
+
+
 def start_dictation():
     if Dict_.active:
         return
@@ -457,7 +481,48 @@ def start_dictation():
         Dict_.started_at = time.time()
     _audio_reset_request.set()  # discard any partially-buffered VAD speech
     border.show('orange')
-    print('\n>>> 语音输入模式 ON (recording)')
+    print(f'\n[{_t()}] >>> 语音输入模式 ON (recording)')
+
+
+# --- Diagnostic (silent, no console output): log every dictation clip —
+# timestamped wav + a TSV line (timestamp, wav name, out/raw/reason/conf) — so a
+# hallucination reported as "a few minutes ago" can be located by time against
+# the REAL mic audio instead of guessed at, and good cases promoted into the
+# regression corpus. Persisted under `dictation_debug_dir` (config); set it empty
+# to disable. Auto-prunes to the most recent _DICT_DUMP_KEEP clips. ---
+_DICT_DUMP_DIR = cfg.get('dictation_debug_dir') or ''
+_DICT_DUMP_KEEP = 300
+
+
+def _dump_dictation(audio: np.ndarray, text: str, diag: dict | None = None):
+    if not _DICT_DUMP_DIR:
+        return
+    try:
+        import soundfile as sf
+        os.makedirs(_DICT_DUMP_DIR, exist_ok=True)
+        now = datetime.now()
+        wav = f'{now.strftime("%Y%m%d-%H%M%S-%f")[:-3]}.wav'
+        sf.write(os.path.join(_DICT_DUMP_DIR, wav), audio, SR)
+        d = diag or {}
+        # `out` is what was pasted (often '' when filtered); `raw` is Whisper's
+        # unfiltered output — so a hallucination caught by the blacklist still has
+        # its text + which layer killed it recorded here, not lost.
+        raw = d.get('raw', text)
+        reason = d.get('reason')
+        with open(os.path.join(_DICT_DUMP_DIR, 'dictation_log.tsv'),
+                  'a', encoding='utf-8') as f:
+            f.write(f'{now.isoformat(timespec="milliseconds")}\t{wav}\t'
+                    f'out={text!r}\traw={raw!r}\treason={reason}\t'
+                    f'no_speech={d.get("no_speech")}\tavg_logprob={d.get("avg_logprob")}\t'
+                    f'win_rms={d.get("win_rms")}\tvad={d.get("vad")}\n')
+        wavs = sorted(p for p in os.listdir(_DICT_DUMP_DIR) if p.endswith('.wav'))
+        for old in wavs[:-_DICT_DUMP_KEEP]:
+            try:
+                os.remove(os.path.join(_DICT_DUMP_DIR, old))
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def stop_dictation():
@@ -471,21 +536,44 @@ def stop_dictation():
         chunks = Dict_.chunks[:]
         Dict_.chunks = []
     _audio_reset_request.set()  # flush VAD state so first post-dictation utterance is clean
-    border.hide()
     if not chunks:
-        print('>>> 语音输入模式 OFF (no audio)')
+        border.hide()
+        print(f'[{_t()}] >>> 语音输入模式 OFF (no audio)')
         return
     audio = np.concatenate(chunks)
     duration = len(audio) / SR
-    print(f'>>> 语音输入模式 OFF, recorded {duration:.1f}s, transcribing...')
+    print(f'[{_t()}] >>> 语音输入模式 OFF, recorded {duration:.1f}s, transcribing...')
     if duration < 0.3:
-        print('  too short, skipped')
+        border.hide()
+        print(f'[{_t()}]   too short, skipped')
+        _dump_dictation(audio, '<too short>')
         return
-    text = _transcribe(audio, force=True)
+    # Recording over; Whisper is now computing — switch border orange → blue until done.
+    border.show('blue')
+    try:
+        diag: dict = {}
+        text = _transcribe(audio, force=True, diag=diag)
+    finally:
+        border.hide()
+    _dump_dictation(audio, text, diag)  # silent: stash real audio + raw result for diagnosis
     if not text:
-        print('  (empty)')
+        # "(empty)" alone is undebuggable. Use the diag to say WHY it was empty so
+        # a dead mic is findable instead of mysterious.
+        reason = diag.get('reason')
+        win_rms = diag.get('win_rms') or 0.0
+        if reason == 'rms_gate' and win_rms < 0.001:
+            # Pure digital silence (win_rms≈0): the stream ran but every sample was
+            # zero. A real mic always carries a noise floor, so this isn't a quiet
+            # room — the source delivered nothing, almost always a wireless mic whose
+            # transmitter is off / muted / out of range / flat.
+            print(f'[{_t()}]   ⚠️  录到纯静音 (win_rms={win_rms:.4f}) — 麦克风没有真实音频输入!')
+            print(f'[{_t()}]      多半是无线麦发射端掉线: 检查开机 / 电量 / 配对 / 是否误触静音键。')
+        elif reason == 'rms_gate':
+            print(f'[{_t()}]   ⚠️  音量太低 (win_rms={win_rms:.4f}) — 没说话? 或离麦太远 / 增益太小。')
+        else:
+            print(f'[{_t()}]   (empty, 被 {reason} 层拦下)')
         return
-    print(f'[Dictation] {text}')
+    print(f'[{_t()}] [Dictation] {text}')
     pyperclip.copy(text)
     with _kb.pressed(Key.ctrl):
         _kb.tap(KeyCode.from_char('v'))
@@ -503,7 +591,7 @@ def toggle_dictation():
 
 # ---------------- Transcription wrapper (passes config to asr.transcribe) ----------------
 
-def _transcribe(audio: np.ndarray, force: bool = False) -> str:
+def _transcribe(audio: np.ndarray, force: bool = False, diag: dict | None = None) -> str:
     return asr.transcribe(
         whisper, audio,
         language=cfg.get('language'),
@@ -512,11 +600,14 @@ def _transcribe(audio: np.ndarray, force: bool = False) -> str:
         condition_on_previous_text=cfg.get('condition_on_previous_text', False),
         temperature=cfg.get('temperature', 0.0),
         vad_filter=cfg.get('vad_filter', False),
+        vad_threshold=cfg.get('dictation_vad_threshold', 0.6),
         rms_min=cfg.get('rms_min', 0.005),
+        rms_peak_min=cfg.get('rms_peak_min', 0.005),
         no_speech_max=cfg.get('no_speech_max', 1.0),
         avg_logprob_min=cfg.get('avg_logprob_min', -10),
         hallucinations=HALLUCINATIONS,
         force=force,
+        diag=diag,
     )
 
 
@@ -642,7 +733,28 @@ def turn_watcher_loop():
 
 # ---------------- Always-on audio loop ----------------
 
+# No-callback-for-this-long ⇒ the device stopped delivering audio (USB unplugged,
+# stream wedged). PortAudio fires the callback even during silence, so a gap this
+# long is a real disconnect, not a quiet room — it triggers a reconnect. This is a
+# plain wall-clock watchdog (not an OS hot-plug event), so it self-heals identically
+# on Linux, Windows and macOS.
+_AUDIO_STALL_SEC = 3.0
+
+# Callbacks keep arriving but every sample is exactly zero for this long ⇒ the mic
+# SOURCE is dead even though the USB device is alive. A wireless receiver whose
+# transmitter dropped keeps streaming pure zeros; a real mic always carries a noise
+# floor, so sustained exact-zero is a reliable "source lost" signal — distinct from
+# _AUDIO_STALL_SEC (no callbacks at all = device unplugged). Without this the only
+# symptom is silently-empty dictation, which is undebuggable from the user's side.
+_SILENCE_WARN_SEC = 5.0
+
+
 def audio_loop():
+    """Supervised, self-healing capture loop. Resolves a mic, opens a stream, and
+    runs the VAD pipeline until the device stalls or errors — then re-resolves and
+    reconnects. If no acceptable mic exists it waits (polling) rather than grabbing
+    a phantom card. Reconnect-on-loss only: a working mic is never pre-empted just
+    because a more-preferred one was plugged in mid-session."""
     vad_iter = VADIterator(
         vad_model,
         sampling_rate=SR,
@@ -650,114 +762,163 @@ def audio_loop():
         min_silence_duration_ms=cfg.get('vad_min_silence_ms', 700),
     )
     chunk_samples = 512  # silero-vad expects 512 @ 16kHz
-
-    buffer: list = []
-    in_speech = False
-    pre_roll: list = []
     PRE_ROLL_CHUNKS = 6  # ~192ms
 
     q: list = []
     q_lock = threading.Lock()
+    waiting_logged = False
 
-    # If the mic can't capture at SR (16k) natively, capture at HW_SR and
-    # streaming-resample to SR inside the callback. soxr.ResampleStream keeps
-    # filter state across calls, so variable input block sizes are fine.
-    need_resample = (HW_SR != SR)
-    if need_resample:
-        import soxr
-        resampler = soxr.ResampleStream(HW_SR, SR, 1, dtype='float32', quality='HQ')
+    while True:
+        dev = _resolve_input_device()
+        if dev is None:
+            if not waiting_logged:
+                print(f'[{_t()}] [Audio] 无可用麦克风,等待设备接入...')
+                waiting_logged = True
+            time.sleep(1.0)
+            continue
+        hw_sr = _probe_hw_sr(dev['index'])
+        if not hw_sr:
+            print(f"[{_t()}] [Audio] 设备 [{dev['index']}] {dev['name']} 不支持任何采样率,跳过")
+            time.sleep(1.0)
+            continue
+        waiting_logged = False
 
-    scratch = [np.empty(0, dtype=np.float32)]  # leftover 16k samples between callbacks
-
-    def cb(indata, *_):
-        in_samples = indata[:, 0]
+        # Per-connection state, rebuilt on every (re)connect so a fresh stream
+        # never inherits a stale resampler or partial chunk from a dead device.
+        # If the mic can't capture at SR (16k) natively, capture at hw_sr and
+        # streaming-resample to SR inside the callback. soxr.ResampleStream keeps
+        # filter state across calls, so variable input block sizes are fine.
+        need_resample = (hw_sr != SR)
         if need_resample:
-            out_samples = resampler.resample_chunk(in_samples)
+            import soxr
+            resampler = soxr.ResampleStream(hw_sr, SR, 1, dtype='float32', quality='HQ')
         else:
-            out_samples = in_samples.copy()
-        if len(out_samples) == 0:
-            return
-        scratch[0] = np.concatenate([scratch[0], out_samples])
-        while len(scratch[0]) >= chunk_samples:
-            chunk = scratch[0][:chunk_samples].copy()
-            scratch[0] = scratch[0][chunk_samples:]
-            with q_lock:
-                q.append(chunk)
-            if Dict_.active:
-                with Dict_.lock:
-                    Dict_.chunks.append(chunk)
-                    if time.time() - Dict_.started_at > DICT_MAX_SEC:
-                        # Defer the actual stop_dictation work to a worker thread —
-                        # don't run paste / Whisper inside the audio callback.
-                        threading.Thread(target=stop_dictation, daemon=True).start()
-
-    hw_blocksize = chunk_samples if not need_resample else int(round(chunk_samples * HW_SR / SR))
-    with sd.InputStream(samplerate=HW_SR, channels=1, dtype='float32',
-                        blocksize=hw_blocksize, callback=cb) as _stream:
+            resampler = None
+        scratch = [np.empty(0, dtype=np.float32)]  # leftover 16k samples between callbacks
+        last_cb = [time.monotonic()]
+        last_nonzero = [time.monotonic()]  # last time a non-zero sample arrived (dead-source watchdog)
+        silence_warned = [False]
         try:
-            _dev_idx = _stream.device if isinstance(_stream.device, int) else _stream.device[0]
-            _dev = sd.query_devices(_dev_idx)
-            _host = sd.query_hostapis(_dev['hostapi'])['name']
-            print(f"\n[Audio] Listening on: [{_dev_idx}] {_dev['name']} "
-                  f"({_host}, native_sr={int(_dev['default_samplerate'])}, "
-                  f"in_ch={_dev['max_input_channels']}) -> resampled to {SR}Hz mono")
-        except Exception as _e:
-            print(f"\n[Audio] Listening on default input device. (query failed: {_e})")
-        while True:
-            # Flush VAD pipeline if requested (dictation start/stop).
-            if _audio_reset_request.is_set():
-                _audio_reset_request.clear()
-                buffer = []
-                pre_roll = []
-                in_speech = False
-                try:
-                    vad_iter.reset_states()
-                except Exception:
-                    pass
+            vad_iter.reset_states()
+        except Exception:
+            pass
+        buffer: list = []
+        in_speech = False
+        pre_roll: list = []
+        with q_lock:
+            q.clear()
+
+        def cb(indata, *_):
+            last_cb[0] = time.monotonic()
+            in_samples = indata[:, 0]
+            out_samples = resampler.resample_chunk(in_samples) if need_resample else in_samples.copy()
+            if len(out_samples) == 0:
+                return
+            if out_samples.any():  # any non-zero ⇒ source is live (a real mic's noise floor counts)
+                last_nonzero[0] = time.monotonic()
+            scratch[0] = np.concatenate([scratch[0], out_samples])
+            while len(scratch[0]) >= chunk_samples:
+                chunk = scratch[0][:chunk_samples].copy()
+                scratch[0] = scratch[0][chunk_samples:]
                 with q_lock:
-                    q.clear()
+                    q.append(chunk)
+                if Dict_.active:
+                    with Dict_.lock:
+                        Dict_.chunks.append(chunk)
+                        if time.time() - Dict_.started_at > DICT_MAX_SEC:
+                            # Defer the actual stop_dictation work to a worker thread —
+                            # don't run paste / Whisper inside the audio callback.
+                            threading.Thread(target=stop_dictation, daemon=True).start()
 
-            with q_lock:
-                chunk = q.pop(0) if q else None
-            if chunk is None:
-                time.sleep(0.005)
-                continue
-            if len(chunk) != chunk_samples:
-                continue
+        hw_blocksize = chunk_samples if not need_resample else int(round(chunk_samples * hw_sr / SR))
+        try:
+            with sd.InputStream(device=dev['index'], samplerate=hw_sr, channels=1,
+                                dtype='float32', blocksize=hw_blocksize, callback=cb):
+                host = sd.query_hostapis(dev['hostapi'])['name']
+                tail = f' -> resampled to {SR}Hz mono' if need_resample else ''
+                print(f"\n[{_t()}] [Audio] Listening on: [{dev['index']}] {dev['name']} "
+                      f"({host}, native_sr={hw_sr}, in_ch={dev['max_input_channels']}){tail}")
+                while True:
+                    now = time.monotonic()
+                    # Device-loss watchdog: no audio delivered ⇒ reconnect.
+                    if now - last_cb[0] > _AUDIO_STALL_SEC:
+                        print(f'[{_t()}] [Audio] 麦克风无数据(可能已拔出),重连中...')
+                        break
 
-            try:
-                event = vad_iter(chunk, return_seconds=False)
-            except Exception as e:
-                print(f'[VAD error]: {e}')
-                continue
+                    # Dead-source watchdog: callbacks arriving but every sample is
+                    # zero ⇒ the mic source is silent (wireless transmitter off / muted
+                    # / out of range), not a quiet room. Warn once per silence episode;
+                    # reset (and announce recovery) when real audio returns so a later
+                    # drop warns again.
+                    if now - last_nonzero[0] > _SILENCE_WARN_SEC:
+                        if not silence_warned[0]:
+                            silence_warned[0] = True
+                            print(f'[{_t()}] [Audio] ⚠️  麦克风持续输出纯静音 '
+                                  f'{_SILENCE_WARN_SEC:.0f}s+ — 发射端可能掉线 / 没电 / 被静音,'
+                                  f'此时录音会全空。检查无线麦发射端。')
+                    elif silence_warned[0]:
+                        silence_warned[0] = False
+                        print(f'[{_t()}] [Audio] ✅ 麦克风音频已恢复。')
 
-            pre_roll.append(chunk)
-            if len(pre_roll) > PRE_ROLL_CHUNKS:
-                pre_roll.pop(0)
+                    # Flush VAD pipeline if requested (dictation start/stop).
+                    if _audio_reset_request.is_set():
+                        _audio_reset_request.clear()
+                        buffer = []
+                        pre_roll = []
+                        in_speech = False
+                        try:
+                            vad_iter.reset_states()
+                        except Exception:
+                            pass
+                        with q_lock:
+                            q.clear()
 
-            if event and 'start' in event:
-                in_speech = True
-                buffer = list(pre_roll)
-                # Barge-in: stop TTS immediately (cheap, user expects "speaking
-                # → assistant shuts up"). Use non-blocking stop — blocking on
-                # proc.wait() here would stall the mic queue and deform VAD
-                # timing. Assumes headphones (otherwise speaker → mic loop).
-                #
-                # We do NOT cancel the in-flight Claude query yet — VAD start
-                # can fire on noise / coughs / self-talk, and cancelling here
-                # would kill a useful task before we know if this is real
-                # input. The cancel decision is deferred to handle_speech,
-                # after transcription, where we have actual text to inspect.
-                if State.listen_mode:
-                    tts.stop_playback_nowait()
-            elif in_speech:
-                buffer.append(chunk)
+                    with q_lock:
+                        chunk = q.pop(0) if q else None
+                    if chunk is None:
+                        time.sleep(0.005)
+                        continue
+                    if len(chunk) != chunk_samples:
+                        continue
 
-            if event and 'end' in event and in_speech:
-                in_speech = False
-                audio = np.concatenate(buffer) if buffer else np.array([], dtype=np.float32)
-                buffer = []
-                threading.Thread(target=handle_speech, args=(audio,), daemon=True).start()
+                    try:
+                        event = vad_iter(chunk, return_seconds=False)
+                    except Exception as e:
+                        print(f'[VAD error]: {e}')
+                        continue
+
+                    pre_roll.append(chunk)
+                    if len(pre_roll) > PRE_ROLL_CHUNKS:
+                        pre_roll.pop(0)
+
+                    if event and 'start' in event:
+                        in_speech = True
+                        buffer = list(pre_roll)
+                        # Barge-in: stop TTS immediately (cheap, user expects "speaking
+                        # → assistant shuts up"). Use non-blocking stop — blocking on
+                        # proc.wait() here would stall the mic queue and deform VAD
+                        # timing. Assumes headphones (otherwise speaker → mic loop).
+                        #
+                        # We do NOT cancel the in-flight Claude query yet — VAD start
+                        # can fire on noise / coughs / self-talk, and cancelling here
+                        # would kill a useful task before we know if this is real
+                        # input. The cancel decision is deferred to handle_speech,
+                        # after transcription, where we have actual text to inspect.
+                        if State.listen_mode:
+                            tts.stop_playback_nowait()
+                    elif in_speech:
+                        buffer.append(chunk)
+
+                    if event and 'end' in event and in_speech:
+                        in_speech = False
+                        audio = np.concatenate(buffer) if buffer else np.array([], dtype=np.float32)
+                        buffer = []
+                        threading.Thread(target=handle_speech, args=(audio,), daemon=True).start()
+        except Exception as e:
+            # Stream open/close failed or the device vanished mid-stream. Re-resolve
+            # and reconnect (or fall back to waiting) on the next loop iteration.
+            print(f'[{_t()}] [Audio] 流错误: {e!r},重连中...')
+        time.sleep(0.5)  # brief backoff so a hard-failing device can't busy-loop
 
 
 def auto_off_loop():

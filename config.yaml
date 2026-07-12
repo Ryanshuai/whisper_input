@@ -14,7 +14,12 @@ activation_key:                   # 留空：禁用对话模式快捷键，只�
 dictation_key: pause              # Pause 键 = 语音输入模式（转录后粘贴到当前应用）
 dictation_press_enter: true       # 语音输入完成后是否自动按回车提交
 sample_rate: 16000
-input_device:                   # 留空 = 用系统默认输入设备；也可填名称子串（如 DJI）或设备 index 数字
+input_device: DJI               # 首选麦克风(名称子串或 index）。音频线程会自愈:每次连接按
+                                # 「此名 → 任意 USB 麦 → 非黑名单设备」挑选,挑不到就等待设备接入
+                                # (绝不抓内置 PCH/HDMI 幻象口录静音);麦拔出/出错会自动重连。留空 = 自动挑。
+# 永不自动选的幻象口名称子串(无真实麦的 HDMI / 内置 HDA codec)。input_device 名与 USB 麦优先于此。
+# Windows 上设备名不同,可按需改。默认:
+# input_device_blocklist: [hdmi, hda nvidia, hda intel pch]；也可填名称子串（如 DJI）或设备 index 数字
 
 # Conversation
 # false = 纯听写模式：只加载 Whisper + 启用 Pause 听写热键，跳过 EOU/TTS/Claude session。
@@ -67,9 +72,31 @@ eou_threshold: 0.2                # EOU 概率 > 此值 视为说完（intl 模�
 eou_force_end_sec: 4.0            # EOU 持续判定"未说完"的最长等待时间，超过强制处理
 
 # Hallucination filter (general, not hard-coded per phrase)
-rms_min: 0.005                    # 音频能量门限：低于此跳过 Whisper（防 VAD 误触发→幻觉）
+rms_min: 0.003                    # 音频「全片均值」能量门限：低于此 *且* 窗峰也低 才跳过 Whisper。
+                                  # 实测教训：0.005 太高，会切掉小声说话——真话 rms 落在 0.0042~0.005
+                                  # （见 captures 里 102928/105618/111052 等，强制转录出来都是真话）。
+                                  # 降到 0.003 救回小声真话；漏进来的低能量噪声幻觉（如 0.0036 的
+                                  # 「字幕志愿者」）仍被第 3 层黑名单兜住，所以这不是放水。
+                                  # ★ 均值 RMS 的硬伤：和片长/静音占比强相关——长片段或前后留白多就被
+                                  # 稀释到门下，于是只能不停调这个数（「一直要改」的根源）。所以又加了一道
+                                  # 长度无关的窗峰判据 rms_peak_min（见下），真正分界靠它，rms_min 基本不用再动。
+rms_peak_min: 0.005               # 「最响 200ms 窗」的 RMS 门限（长度无关）。只有当 全片均值<rms_min
+                                  # 且 窗峰<此值 时才丢弃——任一够响就放行。captures 实测分界很干净：
+                                  # 低能量噪声幻觉窗峰 ≤0.004，最小声真话窗峰 ≈0.008，两侧各约 2× 余量。
+                                  # 这一道救回了被均值稀释的真话（如 27.6s 的 185000-999，均值 0.00296
+                                  # 卡在门下，但窗峰 0.0078 是真话），且不放低能量幻觉进来。
 no_speech_max: 0.8                # Whisper 的 no_speech_prob > 此值 视为幻觉 (1.0 = 禁用)
 avg_logprob_min: -0.8             # Whisper 的平均 logprob < 此值 视为低置信度 (-10 = 禁用)
+# 听写路在转录前跑 Whisper 内置 VAD，剥掉静音/喘气（听写整段没有外部 silero 切片）。
+# 用默认 0.5。实测教训：调高到 0.6 会「过度裁剪」——把本可正常转录的真话截断成幻觉
+# （见回归集 speech_yilai.wav，0.6 会害死它）。而咳嗽幻觉在 0.5 也照样被黑名单兜住，
+# 调高没多救一条，反而误伤真话。真正的防线是「永远生效的黑名单」，不是这个阈值。
+dictation_vad_threshold: 0.5
+
+# 诊断存档：每次听写静默存「时间戳 wav + 一行 TSV(out/raw/哪层拦的/置信度)」，
+# 用来定位漏网幻觉、把好案例升级进回归测试集。自动只留最近 300 条。
+# 留空 = 关闭存档。（之前存 /tmp，重启会丢；改存 agent_space 持久化。）
+dictation_debug_dir: /home/shuai/agent_space/whisper_input_tests/captures
 
 # 唤醒词检测：必须同时包含 wake_names 中任一名字 + wake_triggers_on/off 中任一触发词
 # （词序无关，所以 "Hi Claude" "Claude 开始" "开始 Cloud" 都行）
@@ -125,6 +152,8 @@ backchannel_words:
 # so confidence checks won't catch them. Substring match after punctuation strip.
 hallucinations:
   - "明镜与点点"
+  - "请不吝点赞"
+  - "打赏支持"
   - "Amara.org"
   - "MING PEI OCT 2006"
   - "感谢观看"
