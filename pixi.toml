@@ -29,7 +29,10 @@ ctranslate2 = ">=4.5,<4.8"
 faster-whisper = "*"
 silero-vad = "*"
 edge-tts = "*"
-qwen-tts = "*"            # 本地 Qwen3-TTS 推理
+# qwen-tts 移除：它死钉 transformers==4.57.3，挡住 Qwen3-ASR 需要的 transformers 5.x。
+# 本地 Qwen3-TTS 在 RTX 5080 上 3-15s/句本就不实用，日常用 edge TTS。tts.py 的 qwen3 TTS
+# 懒加载路径随之失效（tts_backend=qwen3 时才触发）；要恢复需单独装兼容的 qwen-tts。
+# qwen-tts = "*"
 # torch 必须从 cu128 index 装才支持 Blackwell (RTX 50 系列)；qwen-tts 默认拉的是 CPU 版
 torch = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
@@ -37,6 +40,8 @@ soundfile = "*"           # numpy → WAV bytes
 claude-agent-sdk = "*"
 tokenizers = "*"          # 轻量 Rust tokenizer，避免拉 torch
 huggingface-hub = "*"     # model download
+transformers = ">=5.13"   # Qwen3-ASR backend（qwen3_asr 模型在 transformers 5.x 才有；懒加载，不影响 faster-whisper 路径）
+accelerate = "*"          # transformers device_map / from_pretrained 加速加载
 
 [tasks]
 start = { cmd = "python main.py", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
