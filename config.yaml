@@ -4,7 +4,7 @@
 backend: qwen3_asr
 
 # --- qwen3_asr backend ---
-qwen_asr_model: Qwen/Qwen3-ASR-1.7B-hf   # 1.7B：实测延迟与 0.6B 几乎相同(~0.8s)，术语更准(如 CUDA)。退回省显存改 0.6B-hf
+qwen_asr_model: Qwen/Qwen3-ASR-0.6B-hf   # 0.6B：省显存（训练同卡时让路）。想要术语更准(如 CUDA)改回 1.7B-hf，延迟几乎相同(~0.8s)
 qwen_asr_language:            # 留空 = 自动语种检测（中英混合首选）；也可填 Chinese / English 强制
 qwen_asr_max_new_tokens: 256
 
@@ -24,9 +24,11 @@ activation_key:                   # 留空：禁用对话模式快捷键，只�
 dictation_key: pause              # Pause 键 = 语音输入模式（转录后粘贴到当前应用）
 dictation_press_enter: true       # 语音输入完成后是否自动按回车提交
 sample_rate: 16000
-input_device: DJI               # 首选麦克风(名称子串或 index）。音频线程会自愈:每次连接按
-                                # 「此名 → 任意 USB 麦 → 非黑名单设备」挑选,挑不到就等待设备接入
-                                # (绝不抓内置 PCH/HDMI 幻象口录静音);麦拔出/出错会自动重连。留空 = 自动挑。
+input_device: [DJI, Analog Stereo]  # 首选麦克风,按顺序找(名称子串或 index,单值也行):DJI 插着优先,
+                                # 没插就用笔记本内置麦(pw-jack 下叫「HDA Intel PCH Analog Stereo」;
+                                # 它在下面黑名单里,所以必须显式列在这才选得中。台式机上模拟口没插麦
+                                # 的话把第二项删掉)。音频线程会自愈:每次连接按「此列表 → 任意 USB 麦
+                                # → 非黑名单设备」挑选,挑不到就等待设备接入;麦拔出/出错会自动重连。
 # 永不自动选的幻象口名称子串(无真实麦的 HDMI / 内置 HDA codec)。input_device 名与 USB 麦优先于此。
 # Windows 上设备名不同,可按需改。默认:
 # input_device_blocklist: [hdmi, hda nvidia, hda intel pch]；也可填名称子串（如 DJI）或设备 index 数字

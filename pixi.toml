@@ -15,7 +15,6 @@ pynput = "*"
 pyperclip = "*"
 setuptools = ">=70,<81"
 ffmpeg = "*"
-soxr = ">=0.1.3,<0.2"
 portaudio = ">=19.7.0,<20"
 
 [target.win-64.dependencies]
@@ -37,6 +36,7 @@ edge-tts = "*"
 torch = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 soundfile = "*"           # numpy → WAV bytes
+soxr = "*"                # 高质量重采样(conda 的 soxr 只是 C 库,import soxr 需 PyPI wheel)
 claude-agent-sdk = "*"
 tokenizers = "*"          # 轻量 Rust tokenizer，避免拉 torch
 huggingface-hub = "*"     # model download

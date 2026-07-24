@@ -112,23 +112,26 @@ def _list_input_devices():
 def _resolve_input_device():
     """Pick the best available capture device, or None if none is acceptable.
 
-    Preference order: (1) the device whose name contains the configured
-    `input_device` substring, or matches it as an index; (2) any USB-Audio mic;
+    Preference order: (1) the configured `input_device` entries — each a name
+    substring or index; a YAML list is tried in order, so [DJI, Analog Stereo]
+    means "DJI when plugged in, else the built-in mic"; (2) any USB-Audio mic;
     (3) any input not on the phantom blocklist. Returning None means 'wait for a
     real mic' — we never fall back to a phantom card that would record silence.
     """
     devs = _list_input_devices()
     if not devs:
         return None
-    if isinstance(_input_dev, int):
-        for d in devs:
-            if d['index'] == _input_dev:
-                return d
-    elif _input_dev:
-        needle = str(_input_dev).lower()
-        for d in devs:
-            if needle in d['name'].lower():
-                return d
+    prefs = _input_dev if isinstance(_input_dev, (list, tuple)) else [_input_dev]
+    for pref in prefs:
+        if isinstance(pref, int):
+            for d in devs:
+                if d['index'] == pref:
+                    return d
+        elif pref:
+            needle = str(pref).lower()
+            for d in devs:
+                if needle in d['name'].lower():
+                    return d
     for d in devs:
         if 'usb' in d['name'].lower():
             return d
