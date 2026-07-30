@@ -71,6 +71,7 @@ from pynput.keyboard import Controller as KbController, Key, KeyCode, Listener
 from silero_vad import VADIterator
 
 import asr
+import asr_context
 import claude_chat
 import tts
 from eou import EouDetector
@@ -166,6 +167,10 @@ LOG_PATH = os.path.join(os.path.dirname(__file__), cfg.get('log_file', 'conversa
 
 asr_backend = asr.load_backend(cfg, HALLUCINATIONS)
 vad_model = asr.load_vad()
+
+# Biasing context ("what am I working on right now") for the dictation path —
+# built on a worker thread while recording, consumed at transcribe time.
+asr_ctx = asr_context.ContextBuilder(cfg)
 
 if CLAUDE_ENABLED:
     print('Loading turn-detector (LiveKit EOU model, ~400MB, first run downloads)...')
@@ -504,6 +509,10 @@ def start_dictation():
         Dict_.active = True
         Dict_.started_at = time.time()
     _audio_reset_request.set()  # discard any partially-buffered VAD speech
+    # Kick off context building now: reading X11 / the recent-docs XML / the live
+    # Claude Code session takes tens of ms, and recording gives us seconds of cover,
+    # so by stop_dictation() it is already sitting in memory.
+    asr_ctx.request()
     border.show('orange')
     print(f'\n[{_t()}] >>> 语音输入模式 ON (recording)')
 
@@ -576,7 +585,7 @@ def stop_dictation():
     border.show('blue')
     try:
         diag: dict = {}
-        text = _transcribe(audio, force=True, diag=diag)
+        text = _transcribe(audio, force=True, diag=diag, context=asr_ctx.get())
     finally:
         border.hide()
     _dump_dictation(audio, text, diag)  # silent: stash real audio + raw result for diagnosis
@@ -599,6 +608,11 @@ def stop_dictation():
         return
     print(f'[{_t()}] [Dictation] {text}')
     pyperclip.copy(text)
+    # Our transcript now enters the clipboard AND, once submitted, the Claude Code
+    # session — both context sources. Register it so neither can feed it back:
+    # otherwise a misrecognized word becomes a term that makes the same mistake
+    # more likely next time. See asr_context.ContextBuilder.note_dictation.
+    asr_ctx.note_dictation(text)
     with _kb.pressed(Key.ctrl):
         _kb.tap(KeyCode.from_char('v'))
     if cfg.get('dictation_press_enter', False):
@@ -615,8 +629,9 @@ def toggle_dictation():
 
 # ---------------- Transcription wrapper ----------------
 
-def _transcribe(audio: np.ndarray, force: bool = False, diag: dict | None = None) -> str:
-    return asr_backend.transcribe(audio, force=force, diag=diag)
+def _transcribe(audio: np.ndarray, force: bool = False, diag: dict | None = None,
+                context: str | None = None) -> str:
+    return asr_backend.transcribe(audio, force=force, diag=diag, context=context)
 
 
 # ---------------- Speech segment handler (per silero-vad end event) ----------------

@@ -80,8 +80,13 @@ class _Backend:
         self.rms_peak_min = rms_peak_min
         self.hallucinations = hallucinations
 
-    def transcribe(self, audio: np.ndarray, *, force: bool = False, diag: dict | None = None) -> str:
+    def transcribe(self, audio: np.ndarray, *, force: bool = False, diag: dict | None = None,
+                   context: str | None = None) -> str:
         """Transcribe audio. Returns '' if filtered out by any layer.
+
+        `context` is a free-text biasing hint describing what the user is
+        currently working on (see asr_context.py). Each backend feeds it to its
+        own biasing mechanism — Qwen's system prompt, Whisper's hotwords.
 
         When `force=True` (user-initiated dictation), the backend's averaged
         confidence checks (Layer 2) are skipped — pressing the hotkey signals real
@@ -113,7 +118,7 @@ class _Backend:
                 diag.update(raw='', reason='rms_gate', rms=rms)
             return ''
 
-        text = self._decode(audio, force=force, rms=rms, diag=diag)
+        text = self._decode(audio, force=force, rms=rms, diag=diag, context=context)
         if not text:
             return ''
 
@@ -129,7 +134,8 @@ class _Backend:
                 return ''
         return text
 
-    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None) -> str:
+    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None,
+                context: str | None) -> str:
         raise NotImplementedError
 
 
@@ -149,7 +155,8 @@ class FasterWhisperBackend(_Backend):
         self.avg_logprob_min = cfg.get('avg_logprob_min', -10.0)
         self.model = load_whisper(cfg['model'], cfg['device'], cfg['compute_type'])
 
-    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None) -> str:
+    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None,
+                context: str | None = None) -> str:
         # Dictation (force=True) has no external silero-vad segmentation, so the
         # blob carries leading/trailing silence + breaths that Whisper hallucinates
         # subtitle pollution on. Turn on faster-whisper's built-in VAD for that path
@@ -157,11 +164,16 @@ class FasterWhisperBackend(_Backend):
         # already tightly VAD-segmented upstream, so it keeps vad_filter as configured.
         use_vad = self.vad_filter or force
 
+        # Whisper's only biasing hook is `hotwords` (a free string prepended in the
+        # sot_prev slot), so the config hotwords and the live context share it.
+        # faster-whisper truncates it to half the prompt window on its own.
+        hotwords = ' '.join(p for p in (self.hotwords, context) if p) or None
+
         segs, _ = self.model.transcribe(
             audio,
             language=self.language,
             initial_prompt=self.initial_prompt,
-            hotwords=self.hotwords,
+            hotwords=hotwords,
             condition_on_previous_text=self.condition_on_previous_text,
             temperature=self.temperature,
             vad_filter=use_vad,
@@ -239,16 +251,27 @@ class Qwen3AsrBackend(_Backend):
         print('Warming up Qwen3-ASR...')
         self._decode(np.zeros(self.sample_rate, dtype=np.float32), force=True, rms=0.0, diag=None)
 
-    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None) -> str:
+    def _decode(self, audio: np.ndarray, *, force: bool, rms: float, diag: dict | None,
+                context: str | None = None) -> str:
         torch = self._torch
-        # apply_transcription_request wants a bare 1-D array (already at the model's
-        # 16 kHz); a (sr, ndarray) tuple is misread as a batch. We capture at 16 kHz.
+        # The chat template wants a bare 1-D array (already at the model's 16 kHz);
+        # a (sr, ndarray) tuple is misread as a batch. We capture at 16 kHz.
         audio = np.ascontiguousarray(audio, dtype=np.float32)
-        req = {'audio': audio}
-        if self.language:
-            req['language'] = self.language
+
+        # Contextual biasing lives in the **system** slot — that is Qwen3-ASR's
+        # native mechanism, and the chat template just concatenates whatever text
+        # is there. `apply_transcription_request` only ever puts the language name
+        # in that slot, so with a context we build the conversation ourselves and
+        # prepend the language (when forced) to keep both behaviours.
+        system_text = '\n'.join(p for p in (self.language, context) if p)
+        messages = []
+        if system_text:
+            messages.append({'role': 'system', 'content': [{'type': 'text', 'text': system_text}]})
+        messages.append({'role': 'user', 'content': [{'type': 'audio', 'audio': audio}]})
         # BatchFeature.to(device, dtype) casts only float tensors, leaves ids intact.
-        inputs = self.processor.apply_transcription_request(**req).to(self.model.device, self.model.dtype)
+        inputs = self.processor.apply_chat_template(
+            [messages], tokenize=True, add_generation_prompt=True, return_dict=True,
+        ).to(self.model.device, self.model.dtype)
         with torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         gen = out[:, inputs['input_ids'].shape[1]:]
