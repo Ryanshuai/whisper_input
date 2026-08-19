@@ -1,0 +1,298 @@
+{
+ "CDN": {
+  "claude_wrote": 575,
+  "heard": {
+   "C D N": 1
+  },
+  "k": 17,
+  "said_right": 2,
+  "verdict": "error"
+ },
+ "CPU": {
+  "claude_wrote": 215,
+  "heard": {
+   "GPU": 13
+  },
+  "k": 12,
+  "said_right": 8,
+  "verdict": "not-an-error",
+  "why": "both are said constantly and mean different things; auto-correcting either way corrupts correct text"
+ },
+ "Claude": {
+  "claude_wrote": 299,
+  "heard": {
+   "CLAW": 2,
+   "Claw": 4,
+   "Cloud": 27,
+   "cloud": 36
+  },
+  "k": 26,
+  "said_right": 3,
+  "verdict": "error"
+ },
+ "Claude Code": {
+  "claude_wrote": null,
+  "heard": {
+   "CLAW CODE": 1
+  },
+  "k": null,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "DETR": {
+  "claude_wrote": 204,
+  "heard": {
+   "D E T R": 1
+  },
+  "k": 5,
+  "said_right": 0,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "H100": {
+  "claude_wrote": 421,
+  "heard": {
+   "H 一百": 1,
+   "H一百": 1
+  },
+  "k": 18,
+  "said_right": 1,
+  "verdict": "error"
+ },
+ "IoU": {
+  "claude_wrote": 758,
+  "heard": {
+   "I O U": 6
+  },
+  "k": 20,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "JSON": {
+  "claude_wrote": null,
+  "heard": {
+   "Jason": 11
+  },
+  "k": null,
+  "said_right": 7,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "MLClaw": {
+  "claude_wrote": 825,
+  "heard": {
+   "M R Claw": 1,
+   "ML CLAW": 1,
+   "mclou": 2
+  },
+  "k": 67,
+  "said_right": 3,
+  "verdict": "error"
+ },
+ "Orbbec": {
+  "claude_wrote": 258,
+  "heard": {
+   "Orbic": 4,
+   "orbic": 2
+  },
+  "k": 5,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "SKU": {
+  "claude_wrote": 2277,
+  "heard": {
+   "S K U": 6
+  },
+  "k": 58,
+  "said_right": 126,
+  "verdict": "error"
+ },
+ "SfM": {
+  "claude_wrote": 164,
+  "heard": {
+   "sim": 14
+  },
+  "k": 10,
+  "said_right": 0,
+  "verdict": "error",
+  "why": "domain term; \"sim\" is a real word, so a corrector needs context — biasing-only until then"
+ },
+ "YOLO": {
+  "claude_wrote": 38,
+  "heard": {
+   "ULO": 3
+  },
+  "k": 5,
+  "said_right": 3,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "anyware-core": {
+  "claude_wrote": 44,
+  "heard": {
+   "anywhere core": 6
+  },
+  "k": 7,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "batch": {
+  "claude_wrote": 145,
+  "heard": {
+   "Match": 4
+  },
+  "k": 8,
+  "said_right": 1,
+  "verdict": "not-an-error",
+  "why": "feature matching is a real topic here"
+ },
+ "e13qh": {
+  "claude_wrote": 1255,
+  "heard": {
+   "E十三QH": 2,
+   "e十三qh": 2
+  },
+  "k": 23,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "hooks": {
+  "claude_wrote": 65,
+  "heard": {
+   "hook": 2
+  },
+  "k": 8,
+  "said_right": 0,
+  "verdict": "not-an-error",
+  "why": "plural, not an error"
+ },
+ "large language model": {
+  "claude_wrote": null,
+  "heard": {
+   "兰舍达格莫特": 1
+  },
+  "k": null,
+  "said_right": 0,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "location": {
+  "claude_wrote": 112,
+  "heard": {
+   "motion": 101
+  },
+  "k": 10,
+  "said_right": 3,
+  "verdict": "not-an-error",
+  "why": "distinct words"
+ },
+ "loss": {
+  "claude_wrote": 983,
+  "heard": {
+   "拉斯": 3
+  },
+  "k": 30,
+  "said_right": 12,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "mode": {
+  "claude_wrote": 90,
+  "heard": {
+   "code": 61
+  },
+  "k": 11,
+  "said_right": 11,
+  "verdict": "not-an-error",
+  "why": "distinct words"
+ },
+ "never": {
+  "claude_wrote": 43,
+  "heard": {
+   "server": 21
+  },
+  "k": 10,
+  "said_right": 0,
+  "verdict": "not-an-error",
+  "why": "distinct words"
+ },
+ "plugin": {
+  "claude_wrote": 158,
+  "heard": {
+   "plug in": 2
+  },
+  "k": 5,
+  "said_right": 9,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "s000": {
+  "claude_wrote": 270,
+  "heard": {
+   "S 零零零": 1
+  },
+  "k": 14,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "shot": {
+  "claude_wrote": 180,
+  "heard": {
+   "short": 3
+  },
+  "k": 9,
+  "said_right": 12,
+  "verdict": "not-an-error",
+  "why": "distinct words"
+ },
+ "sidecar": {
+  "claude_wrote": 26,
+  "heard": {
+   "side car": 1
+  },
+  "k": 1,
+  "said_right": 0,
+  "source": "probe",
+  "verdict": "error"
+ },
+ "skills": {
+  "claude_wrote": 535,
+  "heard": {
+   "skill": 144
+  },
+  "k": 34,
+  "said_right": 2,
+  "verdict": "not-an-error",
+  "why": "plural, not an error"
+ },
+ "train-init": {
+  "claude_wrote": 78,
+  "heard": {
+   "train init": 5
+  },
+  "k": 10,
+  "said_right": 0,
+  "verdict": "error"
+ },
+ "train-run": {
+  "claude_wrote": 185,
+  "heard": {
+   "train": 19
+  },
+  "k": 12,
+  "said_right": 0,
+  "verdict": "not-an-error",
+  "why": "truncated compound, not a misrecognition"
+ },
+ "雾凇": {
+  "claude_wrote": 92,
+  "heard": {
+   "兀兀兀松": 1
+  },
+  "k": 2,
+  "said_right": 2,
+  "source": "probe",
+  "verdict": "error"
+ }
+}
