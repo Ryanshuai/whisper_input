@@ -84,6 +84,15 @@ _PATH_STOP = {
     'downloads', 'desktop', 'documents', 'pictures', 'videos', 'music', 'screenshots',
     'untitled', 'index', 'main', 'test', 'tests', 'build', 'dist', 'node_modules',
     os.path.basename(HOME).lower(),
+    # Application chrome and source-code literals. Same category — they ride in
+    # on titles and on Claude's code blocks, recur in every single session, and
+    # are never spoken. In the persistent store they had accumulated k=171
+    # sessions apiece, which put `Visual` and `Studio` above every real term the
+    # user has; and unlike ordinary jargon the said-counter cannot demote them,
+    # because "never once uttered" is also what a permanently-misheard word
+    # looks like.
+    'visual', 'studio', 'vscode', 'chrome', 'firefox', 'google', 'nautilus',
+    'none', 'true', 'false', 'null',
 }
 
 _CJK_RE = re.compile(r'[一-鿿]+')
@@ -126,6 +135,45 @@ def _is_prose(line: str) -> bool:
         return False
     has_cjk = bool(_CJK_RE.search(line))
     return has_cjk or ' ' in line.strip()
+
+
+_SENT_RE = re.compile(r'[\n。！？；]|(?<=[.!?])\s')
+_MD_RE = re.compile(r'[`*#>|_\[\]]+')
+
+
+def _assistant_snippets(assistants: list[str], max_chars: int, reject=None) -> list[str]:
+    """Quotable prose lines out of Claude's replies, newest first.
+
+    The snippet channel used to be fed by user turns alone, on the reasoning that
+    assistant replies are too verbose to quote and written in the wrong register.
+    That holds for a whole reply — but it silently assumed user prose would be
+    *there*, and for a user who dictates nearly every message it is not: every
+    user turn is our own transcript, so note_dictation() subtracts all of them and
+    the prose section comes out empty. Measured live: 0 chars of context.
+
+    A reply split to sentences survives *that* objection — a single sentence is
+    still prose the model has seen, topical, carrying the jargon's correct
+    spelling in situ. What it does not survive is measurement: as a top-up to the
+    user's own prose it is neutral, and on its own it is worse than sending
+    nothing. So collect() gates it on there being user prose to top up, and the
+    dictation-only case this was written for stays empty on purpose. See the
+    comment at the call site for the numbers.
+
+    `reject` is ContextBuilder._is_own_output. Claude quotes the user, so a reply
+    can contain an ASR error verbatim; without this the self-reinforcement loop
+    that note_dictation() exists to cut would simply reopen one source over.
+    """
+    out, seen = [], set()
+    for text in assistants:
+        for s in _SENT_RE.split(text):
+            s = _MD_RE.sub('', s or '').strip()
+            if not (8 <= len(s) <= max_chars) or not _is_prose(s):
+                continue
+            if s in seen or (reject is not None and reject(s)):
+                continue
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 # ---------------- sources ----------------
@@ -239,6 +287,18 @@ _HARNESS_RE = re.compile(
     r')', re.I)
 
 
+# Words that appear in *every* window title or *every* project path here, so
+# matching on them tells you nothing about which project you are typing into.
+# 'code' is the load-bearing one twice over: it ends every "… - Visual Studio
+# Code" title and it names the directory every project lives in.
+_PROJECT_STOP = _PATH_STOP | {'code', 'window', 'terminal',
+                              'claude', 'project', 'projects'}
+
+
+def _match_words(words) -> set:
+    return {w for w in words if len(w) >= 3 and w not in _PROJECT_STOP}
+
+
 def _newest_session_file(window_title: str, max_age_sec: float = 1800) -> str:
     """Pick the live Claude Code session, or '' when none is confidently live.
 
@@ -279,11 +339,18 @@ def _newest_session_file(window_title: str, max_age_sec: float = 1800) -> str:
     files.sort(reverse=True)
 
     # Project dirs flatten '/' AND '_' to '-', so match on the same normalization.
-    title_words = {w for w in re.split(r'[^A-Za-z0-9]+', window_title.lower()) if len(w) >= 3}
+    #
+    # Both sides must be filtered by _PROJECT_STOP or the gate silently does
+    # nothing: every VSCode title ends "Visual Studio Code" and every project
+    # here lives under ~/code, so the word `code` alone matched all 14 projects
+    # and the loop just returned files[0] — the same answer as the fallback.
+    # With many sessions open at once (background agents append constantly),
+    # "globally newest" is whichever agent flushed last, i.e. a coin flip, and
+    # the docstring above says a wrong session is worse than no context at all.
+    title_words = _match_words(re.split(r'[^A-Za-z0-9]+', window_title.lower()))
     if title_words:
         for _mtime, proj, path in files:
-            proj_words = {w for w in proj.lower().split('-') if len(w) >= 3}
-            if title_words & proj_words:
+            if title_words & _match_words(proj.lower().split('-')):
                 return path
     return files[0][2]
 
@@ -453,6 +520,96 @@ context session message request response result status enable disable default
 '''.split())
 
 
+_LINE_REF_RE = re.compile(r'^L\d+(-L?\d+)?$')
+# Git short SHAs and hash-suffixed branch names. Measured live, these took the
+# top slots of a 30-term correction list: dd1ca45, b15a24, a559f49, mlclaw-80,
+# mlclaw-d2 — scored high because difficulty() rewards digit/letter mixtures,
+# and nobody has ever said one out loud. Requiring a digit keeps real words made
+# of hex letters (`face`, `decade`, `beef`).
+_HASHISH_RE = re.compile(
+    r'(?i)^(?=.*[0-9])(?:[0-9a-f]{6,40}|[A-Za-z]+-[0-9a-f]{1,8})$')
+
+# _LATIN_STOP minus the entries whose easiness is a *writing* property, not a
+# speech one. `json` sits in that list and is exactly the word that comes back as
+# "Jason"; the list was built to keep ordinary prose out of a term bag, and it
+# does that job, but it also silently made the worst code-switching offenders
+# unbiasable. Only the correction path uses this narrowed set — the general term
+# ranking still wants the full list, because there the words are competing on
+# frequency and `data`/`file`/`code` really would crowd it out.
+_SPEECH_HARD = frozenset('''
+json yaml html code text data file files line lines net org com
+'''.split())
+
+
+def _speakable(term: str) -> bool:
+    """Would a person ever say this token out loud?
+
+    A biasing slot is only worth spending on a word that can be *spoken and
+    misheard*. difficulty() ranks the opposite way — it scores identifier shape
+    (underscores, dots, digits, inner capitals) at 1.0 because such spellings are
+    arbitrary and easy to get wrong in writing. Measured, that inverted ranking
+    filled every slot with `no_thin_cloud`, `nvidia-cuda-mps-control`, `g.20gb`,
+    `sku_505x336x194`, `L16-L19` — and pushed out `loss`, which was sitting in the
+    same candidate pool. config.yaml already documents this trap for recent_docs
+    ("sfm_260729_s001.rrd 这种名字根本没人会念出来"); this is the same trap reached
+    from the ranking side instead of the source side.
+
+    Kept: pronounceable names, including alnum ones people do say — H100, L40S,
+    RT-DETR, COCO, IoU. Dropped: paths, filenames, flags, long snake_case.
+    """
+    if '_' in term or '.' in term or term.count('-') > 1 or len(term) > 12:
+        return False
+    if _LINE_REF_RE.match(term) or _HASHISH_RE.match(term):
+        return False
+    return term.lower() not in _PATH_STOP
+
+
+def correction_terms(assistant_pool: str, own_output_raw: list[str], limit: int,
+                     *, cjk_min_count: int = 2, latin_only: bool = True) -> list[str]:
+    """Words Claude used that our own transcripts never once produced.
+
+    This is the recognizer's own error list, read off the conversation for free.
+    You say 拉斯, Claude answers about `loss` — so `loss` is the correct spelling
+    of a word we demonstrably cannot produce, which is precisely what a biasing
+    slot is for.
+
+    The general ranking cannot surface these, and not by accident: rank_terms
+    scores evidence × difficulty, and a word the recognizer already gets right
+    appears in BOTH the user pool and the assistant pool, doubling its evidence
+    and taking the slot, while the corrected word appears only on Claude's side at
+    weight 2 and gets crowded out. The ranking systematically demotes exactly the
+    terms worth spending on.
+
+    `own_output_raw` is the note_dictation() window, used the other way round:
+    there it says "never quote this back to me", here it says "whatever is missing
+    from this is what the recognizer failed to produce".
+
+    Ranked by count × difficulty. Frequency is normally the wrong signal — it
+    promotes the common words that need no help — but that objection is spent once
+    the pool is filtered to terms we never produced. Inside that pool, how often
+    Claude writes a word is clean evidence of what the conversation is about.
+
+    NOTE the filter order: speakability and latin_only are applied BEFORE the cap.
+    Capping first spends slots on terms that are then discarded — measured, that
+    left barely a dozen terms at limit=30 and dropped `loss` (rank 15 of 55) and
+    `JSON` (rank 22 of 87) off a list both comfortably fit.
+    """
+    if limit <= 0:
+        return []
+    said: set = set()
+    for text in own_output_raw:
+        said |= {t.lower() for t in _LATIN_RE.findall(text)}
+        said |= set(_cjk_terms(text, 1))
+    counts: Counter = Counter(
+        t for t in _LATIN_RE.findall(assistant_pool)
+        if len(t) >= 3 and t.lower() not in (_LATIN_STOP - _SPEECH_HARD) and _speakable(t))
+    if not latin_only:
+        counts.update(_cjk_terms(assistant_pool, cjk_min_count))
+    scored = {t: c * difficulty(t) for t, c in counts.items()
+              if t.lower() not in said and t not in said}
+    return [t for t, _ in sorted(scored.items(), key=lambda kv: -kv[1])[:limit]]
+
+
 def _latin_terms(pool: str, min_len: int) -> Counter:
     counts: Counter = Counter()
     for tok in _LATIN_RE.findall(pool):
@@ -566,6 +723,83 @@ class Lexicon:
         if len(self.terms) > self.max_terms * 1.5:
             self._prune(day)
 
+    def observe_said(self, text: str, now: float):
+        """Record terms our OWN transcripts produced — the other half of the store.
+
+        `observe()` answers "is this word part of the user's world"; this answers
+        "can the recognizer already say it". A term needs both to be scored: the
+        first alone promotes `skill` and `plugin`, which are recognized fine and
+        need no slot. Kept decayed (30-day half-life, same as `_score`) so a word
+        the recognizer stopped producing re-arms instead of staying suppressed by
+        one lucky hit last month.
+
+        This is the ONLY place recognizer output touches the store, and it only
+        ever *demotes* — no spelling from the ASR is ever written as a term, which
+        is the rule the class docstring exists to protect.
+        """
+        if not self.path or not text:
+            return
+        day = now / 86400.0
+        # Latin case-insensitively, because the store keeps Claude's
+        # capitalization ("SKU", "MLClaw") and the recognizer picks its own.
+        # CJK by substring: _cjk_terms is a *discovery* pass and needs a maximal
+        # repeat to fire, so a term said once in one short utterance never
+        # registers through it — which silently left every Chinese term in the
+        # store looking unsayable (干净, 仓库, 只剩 all sat in the top 30).
+        # Asking "did this known term appear" is a different, easier question.
+        latin = {t.lower() for t in _LATIN_RE.findall(text)}
+        for term, e in self.terms.items():
+            if _CJK_RE.search(term):
+                if term not in text:
+                    continue
+            elif term.lower() not in latin:
+                continue
+            e['s'] = self._said(e, day) + 1.0
+            e['sday'] = day
+        self._dirty = True
+
+    @staticmethod
+    def _said(e: dict, day: float) -> float:
+        s = e.get('s', 0.0)
+        if not s:
+            return 0.0
+        return s * 0.5 ** (max(0.0, day - e.get('sday', day)) / 30.0)
+
+    def corrections(self, limit: int, now: float, speakable=None) -> list[str]:
+        """Long-horizon version of correction_terms(): words we cannot say.
+
+        correction_terms() asks the same question of a 30-message window and a
+        20-utterance window, and that short horizon is why a hard word flaps: the
+        first time the recognizer gets `MLClaw` right it lands in the own-output
+        window, the term is subtracted, the next utterance goes out unbiased and
+        it comes back as 「M R Claw」. Measured in the dictation log for 8/18:
+        MLClaw 6 right / 4 wrong, alternating.
+
+        Here the same ratio is taken over months instead: `k` sessions of clean
+        evidence against a decayed count of how often we actually produced it. A
+        word Claude writes in 62 sessions that our transcripts produce six times
+        stays near the top; `skill`, said in most utterances, falls off by itself.
+
+        Unmeasured as of this writing — config.yaml's replay numbers cover the
+        *generic* term bag (ranked by 证据×难度), which lost, and this is a
+        different list. It ships behind `lexicon_corrections` for that reason.
+        """
+        if not self.path or limit <= 0:
+            return []
+        day = now / 86400.0
+        scored = []
+        for t, e in self.terms.items():
+            if e.get('k', 1) < self.min_sessions:
+                continue
+            if speakable is not None and not speakable(t):
+                continue
+            if t.lower() in (_LATIN_STOP - _SPEECH_HARD):
+                continue
+            scored.append((t, self._score(e, day) * difficulty(t)
+                              / (1.0 + self._said(e, day))))
+        scored.sort(key=lambda kv: -kv[1])
+        return [t for t, _ in scored[:limit]]
+
     def _prune(self, day: float):
         """Drop the stale one-offs, keep anything that recurred."""
         keep = {}
@@ -633,6 +867,10 @@ class ContextBuilder:
         # appear — spelled correctly, by something other than the recognizer).
         self.session_assistant_messages = int(c.get('session_assistant_messages', 30))
         self.session_assistant_max_chars = int(c.get('session_assistant_max_chars', 800))
+        self.assistant_snippets = bool(c.get('assistant_snippets', True))
+        self.max_correction_terms = int(c.get('correction_terms', 30))
+        self.lexicon_corrections = int(c.get('lexicon_corrections', 0))
+        self.correction_latin_only = bool(c.get('correction_latin_only', True))
         self.clipboard_max_chars = int(c.get('clipboard_max_chars', 1500))
         self.recent_docs = int(c.get('recent_docs', 8))
         self.cjk_min_count = int(c.get('cjk_min_count', 2))
@@ -648,6 +886,10 @@ class ContextBuilder:
         self._worker: threading.Thread | None = None
         # Recent dictation outputs, normalized — see note_dictation().
         self._own_output: list[str] = []
+        # Same window, unnormalized. correction_terms() tokenizes it, and
+        # _norm_for_match strips the spaces that separate words ("the loss value"
+        # -> "thelossvalue"), so it cannot be tokenized.
+        self._own_raw: list[str] = []
         self.own_output_keep = int(c.get('own_output_keep', 20))
 
     # -- self-contamination guard -------------------------------------------
@@ -669,7 +911,15 @@ class ContextBuilder:
         if not norm:
             return
         self._own_output.append(norm)
+        self._own_raw.append(text)
+        # Teach the store what the recognizer CAN say. Demote-only: observe_said
+        # never creates an entry, so no ASR spelling can enter the vocabulary.
+        try:
+            self.lexicon.observe_said(text, time.time())
+        except Exception:
+            pass
         del self._own_output[:-self.own_output_keep]
+        del self._own_raw[:-self.own_output_keep]
 
     def _is_own_output(self, text: str) -> bool:
         norm = _norm_for_match(text)
@@ -741,7 +991,12 @@ class ContextBuilder:
         title = _active_window_title() if self.use_window else ''
         if title:
             pools.append((self._W_WINDOW, title))
-            clean.append((self._W_WINDOW, title))
+            # NOT clean. A window title is provably not ASR output, but the
+            # persistent store scores by cross-session recurrence and the title
+            # furniture recurs in *every* session: measured on the live store,
+            # `Studio` (k=171) and `Visual` (k=171) ranked #2 and #3 of the whole
+            # lexicon, above MLClaw. It is the recent_docs trap again — a source
+            # that is clean, topical-looking, and never spoken aloud.
         # Recent documents is off by default: the list is dominated by screenshots
         # and build artifacts, and a name like `sfm_260729_s001.rrd` is never said
         # out loud. Measured as the source that crowded real jargon out of the
@@ -766,6 +1021,18 @@ class ContextBuilder:
                 if assistants:
                     pools.append((self._W_SESSION_ASSISTANT, '\n'.join(assistants)))
                     clean.append((self._W_SESSION_ASSISTANT, '\n'.join(assistants)))
+                    # Top up the snippet slots the user's own turns left over —
+                    # but ONLY as a top-up. `snippets` being non-empty is the
+                    # gate, and it is load-bearing, not defensive: measured over
+                    # the 120-clip replay, assistant prose *added to* user prose
+                    # is neutral (CER +0.0004, 12 better / 14 worse = noise),
+                    # while assistant prose ALONE is worse than no context at all
+                    # (CER +0.0110, hard words 3/9 vs 4/9 for empty). Claude's
+                    # register drags the output distribution, and with nothing of
+                    # the user's to anchor against, that drag is all you get.
+                    if self.assistant_snippets and snippets:
+                        snippets.extend(_assistant_snippets(
+                            assistants, self.snippet_max_chars, self._is_own_output))
 
         if self.use_clipboard:
             clip = _read_clipboard(self._is_own_output, self.clipboard_max_chars)
@@ -854,12 +1121,42 @@ class ContextBuilder:
         # populated whenever the term-list shape is worth re-evaluating.
         if clean:
             self.lexicon.observe(self.raw_weights(clean), session_key or 'adhoc', now)
-            self.lexicon.save()
+        # Outside the `if`: note_dictation() also dirties the store (the said
+        # side), and that half would otherwise only reach disk on a build that
+        # happened to have clean sources.
+        self.lexicon.save()
         lex = self.lexicon.top(self.lexicon_terms, now)
 
         if not pools and not lex:
             return ''
         terms = self.rank_terms(pools, lex)
+
+        # Corrections go in FRONT of the ranked terms, and are computed
+        # separately rather than folded into rank_terms, because the two answer
+        # different questions: rank_terms asks "what is this conversation about",
+        # correction_terms asks "what has the recognizer been unable to say". The
+        # second list is short, disjoint by construction, and the only one with
+        # direct evidence attached, so it takes the slots first.
+        asst_pool = '\n'.join(t for w, t in pools if w == self._W_SESSION_ASSISTANT)
+        if asst_pool and self.max_correction_terms:
+            corr = correction_terms(
+                asst_pool, self._own_raw, self.max_correction_terms,
+                cjk_min_count=self.cjk_min_count,
+                latin_only=self.correction_latin_only)
+            if corr:
+                seen = set(corr)
+                terms = corr + [t for t in terms if t not in seen]
+
+        # Then the long-horizon version of the same list. The in-session one
+        # above knows what is being talked about right now; this one knows what
+        # has been unsayable for months, which is the part a 30-message window
+        # structurally cannot see (the 「sidecar」 miss in the original notes).
+        if self.lexicon_corrections:
+            seen = set(terms)
+            terms += [t for t in self.lexicon.corrections(
+                self.lexicon_corrections, now, speakable=_speakable)
+                if t not in seen]
+
         out = self.assemble(terms, snippets)
         if self.debug:
             print(f'[asr_context] {len(terms)} terms ({len(lex)} from lexicon of '

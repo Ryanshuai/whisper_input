@@ -5,6 +5,10 @@ backend: qwen3_asr
 
 # --- qwen3_asr backend ---
 qwen_asr_model: Qwen/Qwen3-ASR-0.6B-hf   # 0.6B：省显存（训练同卡时让路）。想要术语更准(如 CUDA)改回 1.7B-hf，延迟几乎相同(~0.8s)
+# ★ 中英混说变差的时间点对得上 7/24 那次 1.7B→0.6B 降级（laptop mic，为 8G 显存）：
+# loss→拉斯、H100→H一百、YOLO→ULO、JSON→Jason、large language model→兰舍达格莫特。
+# 但 1.7B 至今**没实测过**（8G 装不下第二份，要测得先停听写应用）；先走上下文这条路。
+# 显存账：0.6B 整进程 2.65G → 1.7B 约 4.85G，加桌面 ~1.9G 共 ~6.7G / 8G，能跑但余量小。
 qwen_asr_language:            # 留空 = 自动语种检测（中英混合首选）；也可填 Chinese / English 强制
 qwen_asr_max_new_tokens: 256
 
@@ -64,6 +68,38 @@ asr_context:
                            # 它只会占掉词位,实测里正是它把真术语挤出去的。
                            # 想开就填 8 试试。
   max_chars: 1200          # 整段上下文上限。给多了不但慢,还可能把模型带偏
+  correction_terms: 0      # ★ 2026-08-18 关掉:安慰剂对照证明它和一串无关词没有区别。
+                           # 286 条回放(新语料 8/07~8/18,1.7B 参考):
+                           #   off 0.0576 / corr30 0.0602(+0.0027,硬词 1/15,184 字)
+                           #   placebo20(20 个做菜词) 0.0601(+0.0026,硬词 2/15,138 字)
+                           # 也就是说它那 184 字买到的东西 = 挂任意一段 system 提示词买到的东西。
+                           # 下面 lexicon_corrections 是同一个想法的长周期版本,那个是真有收益。
+                           # 保留原注释备查(想复现就填回 30):
+                           #「Claude 写过、而我的转录里从没出现过的词」= 识别器自己的错题本。
+                           # 你说「拉斯」,Claude 回答里写的是 loss;那 loss 就是一个我们证明
+                           # 产不出来的词的正确拼法——这正是词位该花的地方。
+                           # 为什么不能靠 max_terms 那套排序捞出来:rank_terms 按「证据×难度」打分,
+                           # 而听对了的词在你的话和 Claude 回复里各出现一次、证据翻倍抢走词位;
+                           # 听错的词只在 Claude 那边、权重 2,被系统性挤到榜外。
+                           # 减数用的是 note_dictation() 那个窗口,反过来读:那边说「这些别喂回给我」,
+                           # 这边说「这里面没有的,就是识别器产不出来的」。
+                           # 实测(codeswitch_eval.py,72 条 8/13~8/14):
+                           #   变体          英文词数  vs off   ctx
+                           #   off               182     +0       0
+                           #   user(你的原文)     193    +11     330   ← 你这种全听写场景下恒为空
+                           #   t30(旧排序)        186     +4     189
+                           #   corr30 ←默认       194    +12     178   ← 单位长度产出最高
+                           #   corr_en100        191     +9     521
+                           # ★ 但硬探针 0/7:loss / JSON / H100 **已经在提示词里**了,0.6B 照样输出
+                           #   「拉斯」「Jason」「H 一百」。也就是英文整体多留住了 ~7%,最难那几个没修好。
+                           #   要真修那几个,得换 1.7B(至今未实测,8G 装不下第二份)。
+                           # ★ 中文那边要付点账(context_replay_eval.py,120 条):
+                           #   corr30 CER +0.0112、中文硬词 3/9(不带是 4/9)。原因是它只挖英文词;
+                           #   试过连中文一起挖(corr_all30/60)反而更差(3/9 / 2/9),捞不回「雾凇」——
+                           #   那条 6/9 只有「你打字的原文」拿得到,而你几乎不打字。
+                           # 不想要就填 0。
+  correction_latin_only: true   # false = 中文纠正也挖。实测更差(见上),保持 true。
+
   max_terms: 0             # ★ 默认 0 = 不要术语表,只送最近几句原文。
                            # 这是 120 条回放实验的结论,而且推翻了当初的设计直觉:
                            #   词袋是纯成本——CER 明显变差(+0.010~0.015,17 条变好/31 条变坏),
@@ -89,8 +125,21 @@ asr_context:
   # 所以那部分被 note_dictation() 减掉了(见 asr_context.py)。减完剩下的就是这里。
   # 窗口必须够宽才捞得到术语:8x600 时最近几条全是「重启 VSCode」,
   # 放到 30x800 才出现「雾凇 / 雾凇拼音 / 雾凇词库」——而且是 Claude 写对的那个写法。
-  session_assistant_messages: 30    # 只用来抽术语,不进原文片段(太啰嗦,语气也不是你的)
+  session_assistant_messages: 30    # 主要用来抽术语;拆成句子后也能补原文片段,但只补位,见下
   session_assistant_max_chars: 800
+  assistant_snippets: true # 用户原文不够 max_snippets 时,拿 Claude 回复拆出来的句子补位。
+                           # ★ 只补位,不单干——collect() 里有「snippets 非空」这道闸。
+                           # 起因:你几乎全靠听写跟 Claude 说话,于是 session 里每条 user 消息
+                           # 都是听写产物,被 note_dictation() 全减光,原文片段恒为空
+                           # (实测生产上下文 len=0,整个功能是死的)。
+                           # 但「拿 Claude 回复顶上」实测是**负收益**,所以没有直接放开:
+                           #   变体            CER vs off   好/坏   硬词   ctx
+                           #   snips(用户原文)   +0.0013    15/11   6/9    165
+                           #   snips+asst        +0.0017    12/14   5/9    275   ← 中性,允许
+                           #   asst_only         +0.0110    13/16   3/9    253   ← 比不带还差,禁止
+                           # 6/9 那个成绩靠的是你**打字**的消息;Claude 的回复又长、文体也不是你的,
+                           # 没有你自己的原文去锚,那点文体漂移就是净亏。
+                           # 所以「全靠听写」这个场景下上下文照旧是空的,而且这是对的。
   clipboard_max_chars: 1500
   cjk_min_count: 2         # 中文 n-gram 至少出现几次才算术语(没有分词器,靠「重复出现 + 含生僻字」筛)
   latin_min_len: 4         # 普通英文单词的最短长度;带下划线/连字符/数字/驼峰的不受此限
@@ -112,6 +161,50 @@ asr_context:
   lexicon_max_terms: 4000       # 存储上限,超了按 跨会话次数×频次×新鲜度 淘汰
   lexicon_max_age_days: 120     # 只出现过一次且这么久没再见的词直接丢掉
   lexicon_path: ~/.local/state/whisper_input/lexicon.json   # 留空 = 完全不启用词库
+  lexicon_corrections: 20       # ★ 长期错题本:注入几个「Claude 反复写过、而我的转录长期产不出来」的词。
+                                # 和上面 lexicon_terms 的区别 = 和 correction_terms 对 max_terms 的区别:
+                                # lexicon_terms 问「我的词汇表是什么」(实测在亏),
+                                # 这条问「哪些词识别器长期说不出来」——只有后者值得占词位。
+                                # 打分:跨会话证据 k × 难度 ÷ (1 + 我自己说出来过的次数),后者 30 天半衰。
+                                # 为什么需要它:correction_terms 的两个窗口都太短(30 条回复 / 20 条听写),
+                                # 于是硬词会「跳」——识别器蒙对一次,这词就进了自己的输出窗口、被减掉,
+                                # 下一句没提示又变回错的。8/18 的日志里 MLClaw 就是 6 对 4 错来回跳。
+                                # 这里把同一个比值放到几个月的尺度上算,就不跳了。
+                                # 回填(把历史听写一次性喂进「说得出来」那一侧,否则新装的库全是 s=0、
+                                # skill 和 IoU 并列):
+                                #   pixi run python ~/agent_space/whisper_input_tests/backfill_said.py --apply
+                                # ★ 已实测(2026-08-18,286 条新语料,含安慰剂对照):
+                                #   变体          CER      vs off   好/坏   硬词    ctx
+                                #   off          0.0576     +0       —      1/15     0
+                                #   corr30       0.0602  +0.0027   52/56   1/15   184
+                                #   placebo20    0.0601  +0.0026   48/52   2/15   138  ← 安慰剂地板
+                                #   lexcorr20    0.0527  -0.0049   52/43   2/15    84  ← 唯一真收益
+                                #   lexcorr40    0.0551  -0.0035   56/56   2/15   184
+                                # ★ 唯一一个既打赢 off 又打赢安慰剂的变体,而且上下文最短。
+                                #   两轮独立跑 -0.0048 / -0.0049,稳。
+                                # ★ 但硬词那个 2/15 **不算数**:安慰剂也是 2/15。CER 有收益,硬词没有——
+                                #   跟 config 顶上那条一致(0.6B 拿到正确答案也不采纳)。真要修硬词
+                                #   得走「转录后按错题本改写」那条路,见 .claude/skills/mine-asr-corrections。
+                                # 调到 40 反而变差(上下文长了一倍,收益少三成),别往大调。
+
+  # ★「用 Claude 对我的纠正当提示词」——想法成立,但在 0.6B 上无效。见 codeswitch_eval.py
+  # 的 corr_* 变体。你说「拉斯」,Claude 回复里写的是「loss」,那就是标准答案;而现有排序
+  # 恰好把它排掉(词按「证据×难度」打分:ASR 本来就听对的词在你的话和 Claude 回复里各出现
+  # 一次、证据翻倍抢到词位,听错的词只在 Claude 那边出现、证据低被挤掉)。
+  # 实现成「Claude 写过、而我的转录里从没出现过的词」,路上踩平三个真 bug:
+  #   - difficulty() 把 no_thin_cloud / nvidia-cuda-mps-control / L16-L19 排在 loss 前面
+  #     ——它按「拼写难打」排序,可这些词没人用嘴说(同 recent_docs 那个坑)
+  #   - json 在 _LATIN_STOP 里被整个滤掉,而它正是会变成「Jason」的那个词
+  #   - latin_only 在截断**之后**才过滤,30 个词位实际只剩十几个,loss/JSON 白白掉出榜
+  # 修完后 recall 是够的:loss 第 15/55(82 字)、JSON 第 22/87(150 字)、H100 第 54/121(361 字)。
+  # ★ 但硬探针仍然 0/7,而且是**词已经在提示词里**的情况下:
+  #     提示词 "… GiB MHz baseline MIG epoch pgrep loss Triton …" → 输出仍是「拉斯约束」
+  #     提示词 "… V-DETR JSON"                                   → 输出仍是「Jason 格式化」
+  #     提示词 "… COCO top-k MLP IoU H100 …"                     → 输出仍是「H 一百」
+  #   所以不是「纠正晚一拍」的问题(晚一拍无所谓,同一个词从第二次起就有提示了),
+  #   是 0.6B 拿到正确答案也不采纳。这条路要重新评估,得在 1.7B 上重跑:
+  #     QWEN_ASR_MODEL=Qwen/Qwen3-ASR-1.7B-hf pixi run python .../codeswitch_eval.py
+  #   (笔记本 8G 只装得下一个模型,得先停掉听写应用)
 
   ttl_sec: 20              # 这么多秒内连续听写复用同一份上下文,不重复扫描
   wait_sec: 1.5            # 松手时最多等后台线程这么久;超时就不带上下文转录(不阻塞听写)
@@ -207,6 +300,10 @@ dictation_vad_threshold: 0.5
 # 用来定位漏网幻觉、把好案例升级进回归测试集。自动只留最近 300 条。
 # 留空 = 关闭存档。（之前存 /tmp，重启会丢；改存 agent_space 持久化。）
 dictation_debug_dir: /home/shuai/agent_space/whisper_input_tests/captures
+# ★ 自动只留最近 300 条 = 语料是会过期的。上下文实验的两套语料(7/24~7/30、8/13~8/14)
+#   就是这么被自己删掉的,连带手工校对过的硬词探针一起没了,而它们产出的数字还留在上面
+#   那张表里被引用。现在 captures/pinned.txt 里列的 wav 永不删除(探针都在里面)。
+#   新加探针 = 同时往 PROBES 和 pinned.txt 里加。
 
 # 唤醒词检测：必须同时包含 wake_names 中任一名字 + wake_triggers_on/off 中任一触发词
 # （词序无关，所以 "Hi Claude" "Claude 开始" "开始 Cloud" 都行）
