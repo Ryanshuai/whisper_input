@@ -525,6 +525,20 @@ def start_dictation():
 # to disable. Auto-prunes to the most recent _DICT_DUMP_KEEP clips. ---
 _DICT_DUMP_DIR = cfg.get('dictation_debug_dir') or ''
 _DICT_DUMP_KEEP = 300
+# Clips named here are never pruned. Without it the corpus is perishable and the
+# evals silently lose their ground truth: both earlier context corpora (7/24-7/30
+# and 8/13-8/14) rotated out from under context_replay_eval.py, taking every
+# hand-checked hard-word probe with them, while the numbers they produced stayed
+# quoted in config.yaml. One wav name per line, '#' comments allowed.
+_DICT_DUMP_PINS = 'pinned.txt'
+
+
+def _pinned_clips() -> set:
+    try:
+        with open(os.path.join(_DICT_DUMP_DIR, _DICT_DUMP_PINS), encoding='utf-8') as f:
+            return {ln.split('#')[0].strip() for ln in f} - {''}
+    except OSError:
+        return set()
 
 
 def _dump_dictation(audio: np.ndarray, text: str, diag: dict | None = None):
@@ -548,7 +562,9 @@ def _dump_dictation(audio: np.ndarray, text: str, diag: dict | None = None):
                     f'out={text!r}\traw={raw!r}\treason={reason}\t'
                     f'no_speech={d.get("no_speech")}\tavg_logprob={d.get("avg_logprob")}\t'
                     f'win_rms={d.get("win_rms")}\tvad={d.get("vad")}\n')
-        wavs = sorted(p for p in os.listdir(_DICT_DUMP_DIR) if p.endswith('.wav'))
+        pinned = _pinned_clips()
+        wavs = sorted(p for p in os.listdir(_DICT_DUMP_DIR)
+                      if p.endswith('.wav') and p not in pinned)
         for old in wavs[:-_DICT_DUMP_KEEP]:
             try:
                 os.remove(os.path.join(_DICT_DUMP_DIR, old))

@@ -5,3 +5,4 @@ __pycache__/
 conversations.jsonl
 perf.jsonl
 .perf-backup/
+.claude/skills/mine-asr-corrections/correction_candidates.json
